@@ -494,7 +494,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
     st.divider()
     st.subheader("Liquid Savings & Investments")
     st.markdown(
-        '<div class="info-text">💡 <strong>Smart Withdrawals:</strong> If you need cash in retirement, the system is smart. It pulls from regular taxable accounts first (paying long-term capital gains tax), then traditional 401(k)s (paying ordinary income tax), and saves your tax-free Roth accounts for last to maximize your wealth.</div>',
+        '<div class="info-text">💡 <strong>Smart Withdrawals:</strong> If you need cash in retirement, the system is smart. It pulls from regular taxable accounts first (paying long-term capital gains tax). Once you reach the <strong>eligible age of 59.5</strong>, it will pull from traditional 401(k)s (paying ordinary income tax), and saves your tax-free Roth accounts for last to maximize your wealth.</div>',
         unsafe_allow_html=True)
     df_ast = pd.DataFrame(ud.get('liquid_assets', []))
     if df_ast.empty:
@@ -1411,29 +1411,39 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                     shortfall -= a['bal']
                                     a['bal'] = 0
 
-                    # Sequence 2: Tax-Deferred (Traditional 401k)
+                    # Sequence 2: Tax-Deferred (Traditional 401k) - Grossed up by Marginal Rate (Eligible Age 59.5)
                     if shortfall > 0:
                         for a in sim_assets:
                             if shortfall <= 0: break
                             if a.get('Type') == 'Traditional 401k/IRA':
-                                eff_tax = min(marginal_rate + (state_tax_rate / 100.0), 0.99)
-                                req_gross = shortfall / (1.0 - eff_tax)
-                                if a['bal'] >= req_gross:
-                                    a['bal'] -= req_gross
-                                    total_tax += (req_gross - shortfall)
-                                    shortfall = 0
-                                else:
-                                    withdrawn = a['bal']
-                                    a['bal'] = 0
-                                    net_cash = withdrawn * (1.0 - eff_tax)
-                                    total_tax += (withdrawn - net_cash)
-                                    shortfall -= net_cash
+                                owner = a.get('Owner', 'Me')
+                                owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
+                                if owner_age >= 59.5:
+                                    eff_tax = min(marginal_rate + (state_tax_rate / 100.0), 0.99)
+                                    req_gross = shortfall / (1.0 - eff_tax)
+                                    if a['bal'] >= req_gross:
+                                        a['bal'] -= req_gross
+                                        total_tax += (req_gross - shortfall)
+                                        shortfall = 0
+                                    else:
+                                        withdrawn = a['bal']
+                                        a['bal'] = 0
+                                        net_cash = withdrawn * (1.0 - eff_tax)
+                                        total_tax += (withdrawn - net_cash)
+                                        shortfall -= net_cash
 
-                    # Sequence 3: Tax-Free (Roth/HSA)
+                    # Sequence 3: Tax-Free (Roth/HSA) - No tax drag
                     if shortfall > 0:
                         for a in sim_assets:
                             if shortfall <= 0: break
                             if a.get('Type') in ['Roth 401k/IRA', 'HSA', 'Crypto', '529 Plan', 'Other']:
+                                owner = a.get('Owner', 'Me')
+                                owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
+
+                                # Lock Roth 401k/IRA until eligible age 59.5
+                                if a.get('Type') == 'Roth 401k/IRA' and owner_age < 59.5:
+                                    continue
+
                                 if a['bal'] >= shortfall:
                                     a['bal'] -= shortfall
                                     shortfall = 0
