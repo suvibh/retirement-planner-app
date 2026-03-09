@@ -55,13 +55,17 @@ st.markdown("""
 
     /* Hide marker containers to prevent layout spacing issues */
     div[data-testid="element-container"]:has(.ai-btn-marker),
+    div[data-testid="stElementContainer"]:has(.ai-btn-marker),
     div[data-testid="element-container"]:has(.save-btn-marker),
-    div[data-testid="element-container"]:has(.main-save-btn-marker) {
+    div[data-testid="stElementContainer"]:has(.save-btn-marker),
+    div[data-testid="element-container"]:has(.main-save-btn-marker),
+    div[data-testid="stElementContainer"]:has(.main-save-btn-marker) {
         display: none;
     }
 
     /* AI Button subtle styling */
-    div[data-testid="element-container"]:has(.ai-btn-marker) + div[data-testid="element-container"] button {
+    div[data-testid="element-container"]:has(.ai-btn-marker) + div[data-testid="element-container"] button,
+    div[data-testid="stElementContainer"]:has(.ai-btn-marker) + div[data-testid="stElementContainer"] button {
         background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%) !important;
         border: none !important;
         color: white !important;
@@ -70,13 +74,15 @@ st.markdown("""
         transition: all 0.2s ease !important;
         box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.39) !important;
     }
-    div[data-testid="element-container"]:has(.ai-btn-marker) + div[data-testid="element-container"] button:hover {
+    div[data-testid="element-container"]:has(.ai-btn-marker) + div[data-testid="element-container"] button:hover,
+    div[data-testid="stElementContainer"]:has(.ai-btn-marker) + div[data-testid="stElementContainer"] button:hover {
         transform: translateY(-2px);
         box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.39) !important;
     }
 
     /* Save Button subtle styling */
-    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button {
+    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button,
+    div[data-testid="stElementContainer"]:has(.save-btn-marker) + div[data-testid="stElementContainer"] button {
         background-color: #f0fdf4 !important;
         border: 1px solid #bbf7d0 !important;
         color: #166534 !important;
@@ -84,7 +90,8 @@ st.markdown("""
         border-radius: 8px !important;
         transition: all 0.2s ease !important;
     }
-    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button:hover {
+    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button:hover,
+    div[data-testid="stElementContainer"]:has(.save-btn-marker) + div[data-testid="stElementContainer"] button:hover {
         background-color: #dcfce7 !important;
         border-color: #86efac !important;
         transform: translateY(-2px);
@@ -92,7 +99,8 @@ st.markdown("""
     }
 
     /* Main Action Button (Bottom Save) */
-    div[data-testid="element-container"]:has(.main-save-btn-marker) + div[data-testid="element-container"] button {
+    div[data-testid="element-container"]:has(.main-save-btn-marker) + div[data-testid="element-container"] button,
+    div[data-testid="stElementContainer"]:has(.main-save-btn-marker) + div[data-testid="stElementContainer"] button {
         background: linear-gradient(90deg, #10b981 0%, #059669 100%) !important;
         color: white !important;
         border: none !important;
@@ -101,7 +109,8 @@ st.markdown("""
         box-shadow: 0 4px 14px 0 rgba(16, 185, 129, 0.39) !important;
         transition: all 0.2s ease !important;
     }
-    div[data-testid="element-container"]:has(.main-save-btn-marker) + div[data-testid="element-container"] button:hover {
+    div[data-testid="element-container"]:has(.main-save-btn-marker) + div[data-testid="element-container"] button:hover,
+    div[data-testid="stElementContainer"]:has(.main-save-btn-marker) + div[data-testid="stElementContainer"] button:hover {
         transform: translateY(-2px);
         box-shadow: 0 6px 20px 0 rgba(16, 185, 129, 0.39) !important;
     }
@@ -823,23 +832,28 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
                 sub_c1, sub_c2 = st.columns([5, 2])
 
                 widget_key = f"in_{state_key}"
-                if widget_key not in st.session_state:
-                    st.session_state[widget_key] = float(st.session_state['assumptions'].get(state_key, default_val))
 
-                val = sub_c1.number_input(label, step=0.1, key=widget_key)
+                # We need an empty placeholder for the number input so we can render it AFTER the button is evaluated
+                input_placeholder = sub_c1.empty()
 
                 # CSS trick to align the button with the input field label
-                sub_c2.markdown("<div style='height: 27px;'></div>", unsafe_allow_html=True)
+                sub_c2.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
                 sub_c2.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
+
                 if sub_c2.button("✨ AI", key=f"btn_{state_key}", help=f"AI Estimate for {label}",
                                  use_container_width=True):
-                    with st.spinner(f"AI estimating {label}..."):
+                    with st.spinner("AI estimating..."):
                         res = call_gemini_json(prompt)
                         if res and state_key in res:
                             new_val = float(res[state_key])
                             st.session_state['assumptions'][state_key] = new_val
+                            # Safe state injection before widget initialization
                             st.session_state[widget_key] = new_val
-                            st.rerun()
+
+                if widget_key not in st.session_state:
+                    st.session_state[widget_key] = float(st.session_state['assumptions'].get(state_key, default_val))
+
+                val = input_placeholder.number_input(label, step=0.1, key=widget_key)
 
                 st.session_state['assumptions'][state_key] = val
                 return val
