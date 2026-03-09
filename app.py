@@ -458,122 +458,126 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
 
 # --- 3. ASSETS, LIABILITIES & NET WORTH ---
 with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
-    st.subheader("Real Estate")
-    st.markdown(
-        '<div class="info-text">💡 <strong>Smart Mortgages:</strong> Just tell us your loan balance, interest rate, and monthly payment. The math engine automatically pays down your loan over time and drops the expense entirely once it hits zero! <em>(Make sure you don\'t list your mortgage again in the budget section below).</em></div>',
-        unsafe_allow_html=True)
-    df_re = pd.DataFrame(ud.get('real_estate', []))
-    if df_re.empty:
-        df_re = pd.DataFrame([{"Property Name": "Primary Home", "Is Primary Residence?": True, "Market Value ($)": 0,
-                               "Mortgage Balance ($)": 0, "Interest Rate (%)": 0.0, "Mortgage Payment ($)": 0,
-                               "Monthly Expenses ($)": 0, "Monthly Rent ($)": 0, "Override Prop Growth (%)": None,
-                               "Override Rent Growth (%)": None}])
-    else:
-        df_re = df_re.reindex(
-            columns=["Property Name", "Is Primary Residence?", "Market Value ($)", "Mortgage Balance ($)",
-                     "Interest Rate (%)", "Mortgage Payment ($)", "Monthly Expenses ($)", "Monthly Rent ($)",
-                     "Override Prop Growth (%)", "Override Rent Growth (%)"])
+    tab_re, tab_biz, tab_ast, tab_debt = st.tabs(
+        ["🏢 Real Estate", "💼 Business Interests", "🏦 Liquid Assets", "💳 Debts & Loans"])
 
-    edited_re = st.data_editor(
-        df_re,
-        column_config={
-            "Property Name": st.column_config.TextColumn("Property Name"),
-            "Is Primary Residence?": st.column_config.CheckboxColumn("Primary Home?", default=False),
-            "Market Value ($)": st.column_config.NumberColumn("Market Value ($)", step=10000, format="$%d"),
-            "Mortgage Balance ($)": st.column_config.NumberColumn("Mortgage Balance ($)", step=10000, format="$%d"),
-            "Interest Rate (%)": st.column_config.NumberColumn("Interest Rate (%)", step=0.001, format="%.3f%%"),
-            "Mortgage Payment ($)": st.column_config.NumberColumn("Monthly P&I ($)", step=100, format="$%d"),
-            "Monthly Expenses ($)": st.column_config.NumberColumn("Taxes/Ins/HOA ($)", step=100, format="$%d"),
-            "Monthly Rent ($)": st.column_config.NumberColumn("Monthly Rent ($)", step=100, format="$%d"),
-            "Override Prop Growth (%)": st.column_config.NumberColumn("Property Growth (%)", step=0.1, format="%.1f%%"),
-            "Override Rent Growth (%)": st.column_config.NumberColumn("Rent Growth (%)", step=0.1, format="%.1f%%")
-        }, num_rows="dynamic", width="stretch", hide_index=True, key="re_editor"
-    )
+    with tab_re:
+        st.markdown(
+            '<div class="info-text">💡 <strong>Smart Mortgages:</strong> Just tell us your loan balance, interest rate, and monthly payment. The math engine automatically pays down your loan over time and drops the expense entirely once it hits zero! <em>(Make sure you don\'t list your mortgage again in the budget section below).</em></div>',
+            unsafe_allow_html=True)
+        df_re = pd.DataFrame(ud.get('real_estate', []))
+        if df_re.empty:
+            df_re = pd.DataFrame(
+                [{"Property Name": "Primary Home", "Is Primary Residence?": True, "Market Value ($)": 0,
+                  "Mortgage Balance ($)": 0, "Interest Rate (%)": 0.0, "Mortgage Payment ($)": 0,
+                  "Monthly Expenses ($)": 0, "Monthly Rent ($)": 0, "Override Prop Growth (%)": None,
+                  "Override Rent Growth (%)": None}])
+        else:
+            df_re = df_re.reindex(
+                columns=["Property Name", "Is Primary Residence?", "Market Value ($)", "Mortgage Balance ($)",
+                         "Interest Rate (%)", "Mortgage Payment ($)", "Monthly Expenses ($)", "Monthly Rent ($)",
+                         "Override Prop Growth (%)", "Override Rent Growth (%)"])
 
-    st.divider()
-    st.subheader("Business Interests & Private Equity")
-    df_biz = pd.DataFrame(ud.get('business', []))
-    if df_biz.empty:
-        df_biz = pd.DataFrame(
-            [{"Business Name": "", "Total Valuation ($)": 0, "Your Ownership (%)": 100, "Annual Distribution ($)": 0,
-              "Override Val. Growth (%)": None, "Override Dist. Growth (%)": None}])
-    else:
-        if "Override Val. Growth (%)" not in df_biz.columns: df_biz["Override Val. Growth (%)"] = None
-        if "Override Dist. Growth (%)" not in df_biz.columns: df_biz["Override Dist. Growth (%)"] = None
-        df_biz = df_biz.reindex(
-            columns=["Business Name", "Total Valuation ($)", "Your Ownership (%)", "Annual Distribution ($)",
-                     "Override Val. Growth (%)", "Override Dist. Growth (%)"])
+        edited_re = st.data_editor(
+            df_re,
+            column_config={
+                "Property Name": st.column_config.TextColumn("Property Name"),
+                "Is Primary Residence?": st.column_config.CheckboxColumn("Primary Home?", default=False),
+                "Market Value ($)": st.column_config.NumberColumn("Market Value ($)", step=10000, format="$%d"),
+                "Mortgage Balance ($)": st.column_config.NumberColumn("Mortgage Balance ($)", step=10000, format="$%d"),
+                "Interest Rate (%)": st.column_config.NumberColumn("Interest Rate (%)", step=0.001, format="%.3f%%"),
+                "Mortgage Payment ($)": st.column_config.NumberColumn("Monthly P&I ($)", step=100, format="$%d"),
+                "Monthly Expenses ($)": st.column_config.NumberColumn("Taxes/Ins/HOA ($)", step=100, format="$%d"),
+                "Monthly Rent ($)": st.column_config.NumberColumn("Monthly Rent ($)", step=100, format="$%d"),
+                "Override Prop Growth (%)": st.column_config.NumberColumn("Property Growth (%)", step=0.1,
+                                                                          format="%.1f%%"),
+                "Override Rent Growth (%)": st.column_config.NumberColumn("Rent Growth (%)", step=0.1, format="%.1f%%")
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="re_editor"
+        )
 
-    edited_biz = st.data_editor(
-        df_biz,
-        column_config={
-            "Total Valuation ($)": st.column_config.NumberColumn("Total Value ($)", step=10000, format="$%d"),
-            "Annual Distribution ($)": st.column_config.NumberColumn("Annual Income ($)", step=1000, format="$%d"),
-            "Your Ownership (%)": st.column_config.NumberColumn("Your Ownership (%)", min_value=0, max_value=100,
-                                                                format="%d%%"),
-            "Override Val. Growth (%)": st.column_config.NumberColumn("Value Growth (%)", step=0.1, format="%.1f%%"),
-            "Override Dist. Growth (%)": st.column_config.NumberColumn("Income Growth (%)", step=0.1, format="%.1f%%")
-        }, num_rows="dynamic", width="stretch", hide_index=True, key="biz_editor"
-    )
+    with tab_biz:
+        df_biz = pd.DataFrame(ud.get('business', []))
+        if df_biz.empty:
+            df_biz = pd.DataFrame([{"Business Name": "", "Total Valuation ($)": 0, "Your Ownership (%)": 100,
+                                    "Annual Distribution ($)": 0, "Override Val. Growth (%)": None,
+                                    "Override Dist. Growth (%)": None}])
+        else:
+            if "Override Val. Growth (%)" not in df_biz.columns: df_biz["Override Val. Growth (%)"] = None
+            if "Override Dist. Growth (%)" not in df_biz.columns: df_biz["Override Dist. Growth (%)"] = None
+            df_biz = df_biz.reindex(
+                columns=["Business Name", "Total Valuation ($)", "Your Ownership (%)", "Annual Distribution ($)",
+                         "Override Val. Growth (%)", "Override Dist. Growth (%)"])
 
-    st.divider()
-    st.subheader("Liquid Savings & Investments")
-    st.markdown(
-        '<div class="info-text">💡 <strong>Withdrawal Priority:</strong> You can select your exact drawdown strategy (e.g. Standard vs Roth Preferred) in the Interactive Dashboard below. The system always drains Cash and Brokerage assets before touching any retirement accounts.</div>',
-        unsafe_allow_html=True)
-    df_ast = pd.DataFrame(ud.get('liquid_assets', []))
-    if df_ast.empty:
-        df_ast = pd.DataFrame(
-            [{"Account Name": "Primary 401(k)", "Type": "Traditional 401k/IRA", "Owner": "Me", "Current Balance ($)": 0,
-              "Annual Contribution ($/yr)": 0, "Est. Annual Growth (%)": 7.0, "Stop Contrib at Ret.?": True}])
-    else:
-        if "Annual Contribution ($)" in df_ast.columns: df_ast.rename(
-            columns={'Annual Contribution ($)': 'Annual Contribution ($/yr)'}, inplace=True)
-        if "Stop Contrib at Ret.?" not in df_ast.columns: df_ast["Stop Contrib at Ret.?"] = True
-        df_ast = df_ast.reindex(
-            columns=["Account Name", "Type", "Owner", "Current Balance ($)", "Annual Contribution ($/yr)",
-                     "Est. Annual Growth (%)", "Stop Contrib at Ret.?"])
+        edited_biz = st.data_editor(
+            df_biz,
+            column_config={
+                "Total Valuation ($)": st.column_config.NumberColumn("Total Value ($)", step=10000, format="$%d"),
+                "Annual Distribution ($)": st.column_config.NumberColumn("Annual Income ($)", step=1000, format="$%d"),
+                "Your Ownership (%)": st.column_config.NumberColumn("Your Ownership (%)", min_value=0, max_value=100,
+                                                                    format="%d%%"),
+                "Override Val. Growth (%)": st.column_config.NumberColumn("Value Growth (%)", step=0.1,
+                                                                          format="%.1f%%"),
+                "Override Dist. Growth (%)": st.column_config.NumberColumn("Income Growth (%)", step=0.1,
+                                                                           format="%.1f%%")
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="biz_editor"
+        )
 
-    edited_ast = st.data_editor(
-        df_ast,
-        column_config={
-            "Type": st.column_config.SelectboxColumn("Account Type",
-                                                     options=["Checking/Savings", "HYSA", "Brokerage (Taxable)",
-                                                              "Traditional 401k/IRA", "Roth 401k/IRA", "HSA", "Crypto",
-                                                              "529 Plan", "Other"]),
-            "Owner": st.column_config.SelectboxColumn("Whose Account?", options=["Me", "Spouse", "Joint"]),
-            "Current Balance ($)": st.column_config.NumberColumn("Current Balance ($)", step=5000, format="$%d"),
-            "Annual Contribution ($/yr)": st.column_config.NumberColumn("Annual Additions ($/yr)", step=1000,
-                                                                        format="$%d",
-                                                                        help="Include both your contributions and any employer matches here."),
-            "Est. Annual Growth (%)": st.column_config.NumberColumn("Expected Return (%)", format="%.1f%%"),
-            "Stop Contrib at Ret.?": st.column_config.CheckboxColumn("Stop Adding at Ret.?",
-                                                                     help="Check this if you will stop saving into this account once the owner retires.")
-        }, num_rows="dynamic", width="stretch", hide_index=True, key="assets_editor"
-    )
+    with tab_ast:
+        st.markdown(
+            '<div class="info-text">💡 <strong>Withdrawal Priority:</strong> You can select your exact drawdown strategy (e.g. Standard vs Roth Preferred) in the Interactive Dashboard below. The system always drains Cash and Brokerage assets before touching any retirement accounts.</div>',
+            unsafe_allow_html=True)
+        df_ast = pd.DataFrame(ud.get('liquid_assets', []))
+        if df_ast.empty:
+            df_ast = pd.DataFrame([{"Account Name": "Primary 401(k)", "Type": "Traditional 401k/IRA", "Owner": "Me",
+                                    "Current Balance ($)": 0, "Annual Contribution ($/yr)": 0,
+                                    "Est. Annual Growth (%)": 7.0, "Stop Contrib at Ret.?": True}])
+        else:
+            if "Annual Contribution ($)" in df_ast.columns: df_ast.rename(
+                columns={'Annual Contribution ($)': 'Annual Contribution ($/yr)'}, inplace=True)
+            if "Stop Contrib at Ret.?" not in df_ast.columns: df_ast["Stop Contrib at Ret.?"] = True
+            df_ast = df_ast.reindex(
+                columns=["Account Name", "Type", "Owner", "Current Balance ($)", "Annual Contribution ($/yr)",
+                         "Est. Annual Growth (%)", "Stop Contrib at Ret.?"])
 
-    st.divider()
-    st.subheader("Other Debts & Loans")
-    st.markdown(
-        '<div class="info-text">💡 Just like your mortgage, simply provide the balance, rate, and payment. We\'ll dynamically pay it down to zero for you in the background.</div>',
-        unsafe_allow_html=True)
-    df_debt = pd.DataFrame(ud.get('liabilities', []))
-    if df_debt.empty:
-        df_debt = pd.DataFrame(
-            [{"Debt Name": "Auto Loan", "Type": "Auto Loan", "Current Balance ($)": 0, "Interest Rate (%)": 0.0,
-              "Monthly Payment ($)": 0}])
-    else:
-        df_debt = df_debt.reindex(
-            columns=["Debt Name", "Type", "Current Balance ($)", "Interest Rate (%)", "Monthly Payment ($)"])
+        edited_ast = st.data_editor(
+            df_ast,
+            column_config={
+                "Type": st.column_config.SelectboxColumn("Account Type",
+                                                         options=["Checking/Savings", "HYSA", "Brokerage (Taxable)",
+                                                                  "Traditional 401k/IRA", "Roth 401k/IRA", "HSA",
+                                                                  "Crypto", "529 Plan", "Other"]),
+                "Owner": st.column_config.SelectboxColumn("Whose Account?", options=["Me", "Spouse", "Joint"]),
+                "Current Balance ($)": st.column_config.NumberColumn("Current Balance ($)", step=5000, format="$%d"),
+                "Annual Contribution ($/yr)": st.column_config.NumberColumn("Annual Additions ($/yr)", step=1000,
+                                                                            format="$%d",
+                                                                            help="Include both your contributions and any employer matches here."),
+                "Est. Annual Growth (%)": st.column_config.NumberColumn("Expected Return (%)", format="%.1f%%"),
+                "Stop Contrib at Ret.?": st.column_config.CheckboxColumn("Stop Adding at Ret.?",
+                                                                         help="Check this if you will stop saving into this account once the owner retires.")
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="assets_editor"
+        )
 
-    edited_debt = st.data_editor(
-        df_debt,
-        column_config={
-            "Current Balance ($)": st.column_config.NumberColumn("Current Balance ($)", step=1000, format="$%d"),
-            "Interest Rate (%)": st.column_config.NumberColumn("Interest Rate (%)", step=0.001, format="%.3f%%"),
-            "Monthly Payment ($)": st.column_config.NumberColumn("Monthly Payment ($)", step=100, format="$%d")
-        }, num_rows="dynamic", width="stretch", hide_index=True, key="debt_editor"
-    )
+    with tab_debt:
+        st.markdown(
+            '<div class="info-text">💡 Just like your mortgage, simply provide the balance, rate, and payment. We\'ll dynamically pay it down to zero for you in the background.</div>',
+            unsafe_allow_html=True)
+        df_debt = pd.DataFrame(ud.get('liabilities', []))
+        if df_debt.empty:
+            df_debt = pd.DataFrame(
+                [{"Debt Name": "Auto Loan", "Type": "Auto Loan", "Current Balance ($)": 0, "Interest Rate (%)": 0.0,
+                  "Monthly Payment ($)": 0}])
+        else:
+            df_debt = df_debt.reindex(
+                columns=["Debt Name", "Type", "Current Balance ($)", "Interest Rate (%)", "Monthly Payment ($)"])
+
+        edited_debt = st.data_editor(
+            df_debt,
+            column_config={
+                "Current Balance ($)": st.column_config.NumberColumn("Current Balance ($)", step=1000, format="$%d"),
+                "Interest Rate (%)": st.column_config.NumberColumn("Interest Rate (%)", step=0.001, format="%.3f%%"),
+                "Monthly Payment ($)": st.column_config.NumberColumn("Monthly Payment ($)", step=100, format="$%d")
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="debt_editor"
+        )
 
     # Calculate Live Net Worth
     re_eq = pd.to_numeric(edited_re['Market Value ($)'], errors='coerce').fillna(0).sum() - pd.to_numeric(
@@ -627,122 +631,125 @@ with st.expander("💸 4. Lifestyle Budgets (Current & Retirement)", expanded=Fa
         '<div class="info-text">💡 <strong>AI Budget Builder:</strong> Our AI looks at your city, family size, and income to build a realistic, localized budget. <br><br><strong>Double-Counting Guard:</strong> The simulation automatically ignores "Housing" (if you own) and "Debt Payments" listed below, as it pulls the exact costs from your Assets & Debts section!</div>',
         unsafe_allow_html=True)
 
-    st.markdown("### Current Budget")
-    df_c = pd.DataFrame(st.session_state['current_expenses'])
-    if df_c.empty:
-        df_c = pd.DataFrame([{"Description": "Groceries", "Category": "Food", "Frequency": "Monthly", "Amount ($)": 0,
-                              "AI Estimate?": False}])
-    else:
-        if "AI Estimate?" not in df_c.columns: df_c["AI Estimate?"] = False
-        df_c = df_c.reindex(columns=["Description", "Category", "Frequency", "Amount ($)", "AI Estimate?"])
+    tab_curr, tab_ret = st.tabs(["📅 Current Budget", "🏖️ Retirement Budget"])
 
-    edited_c = st.data_editor(
-        df_c,
-        column_config={
-            "Category": st.column_config.SelectboxColumn("Category", options=budget_categories),
-            "Frequency": st.column_config.SelectboxColumn("Frequency", options=["Monthly", "Yearly"]),
-            "Amount ($)": st.column_config.NumberColumn("Amount ($)", step=100, format="$%d"),
-            "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI Estimate?")
-        }, num_rows="dynamic", width="stretch", hide_index=True, key="cur_ed"
-    )
+    with tab_curr:
+        df_c = pd.DataFrame(st.session_state['current_expenses'])
+        if df_c.empty:
+            df_c = pd.DataFrame(
+                [{"Description": "Groceries", "Category": "Food", "Frequency": "Monthly", "Amount ($)": 0,
+                  "AI Estimate?": False}])
+        else:
+            if "AI Estimate?" not in df_c.columns: df_c["AI Estimate?"] = False
+            df_c = df_c.reindex(columns=["Description", "Category", "Frequency", "Amount ($)", "AI Estimate?"])
 
-    cur_m_total, cur_y_total = 0, 0
-    for r in edited_c.to_dict('records'):
-        if str(r.get("Description", "")).strip() != "":
-            amt = safe_num(r.get("Amount ($)"))
-            if r.get("Frequency") == "Monthly":
-                cur_m_total += amt
-                cur_y_total += amt * 12
-            else:
-                cur_y_total += amt
-                cur_m_total += amt / 12
-    render_total("Est. Total Baseline Budget", f"${cur_m_total:,.0f} / mo  |  ${cur_y_total:,.0f} / yr")
+        edited_c = st.data_editor(
+            df_c,
+            column_config={
+                "Category": st.column_config.SelectboxColumn("Category", options=budget_categories),
+                "Frequency": st.column_config.SelectboxColumn("Frequency", options=["Monthly", "Yearly"]),
+                "Amount ($)": st.column_config.NumberColumn("Amount ($)", step=100, format="$%d"),
+                "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI Estimate?")
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="cur_ed"
+        )
 
-    col_ai_cb, col_sv_cb = st.columns([3, 1])
-    with col_ai_cb:
-        st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("✨ Auto-Estimate Budget for " + (curr_city if curr_city else "Your Area") + " (AI)",
-                     use_container_width=True):
-            with st.spinner("Analyzing localized CPI data and family needs..."):
-                valid = edited_c[edited_c["Description"].astype(str) != ""].copy()
-                locked = valid[valid["AI Estimate?"] == False].to_dict('records')
-                locked_desc = [x['Description'] for x in locked]
-                wealth_ctx = f"The household has a current annual pre-tax income of ${curr_inc_total:,.0f} and liquid assets totaling ${liq_ast_total:,.0f}. VERY IMPORTANT: While you should scale the budget to reflect this wealth, assume these users are savvy spenders and aggressive savers (comfortable but smart with money), so avoid over-inflating lifestyle costs unnecessarily."
-                allowed_cats = ", ".join(budget_categories)
-                prompt = f"City: {curr_city}. Family: {k_ctx} Housing: {h_ctx}. {wealth_ctx} Generate 10-15 missing living expenses to create a complete monthly budget. {ai_exclusion} Skip these items as they are already accounted for: {json.dumps(locked_desc)}. Return ONLY a JSON array of objects with keys: 'Description', 'Category' (MUST be exactly one of: {allowed_cats}. If unsure, default to 'Other'), 'Frequency' (Monthly/Yearly), 'Amount ($)' (number), 'AI Estimate?' (true)."
-                res = call_gemini_json(prompt)
-                if res and isinstance(res, list) and len(res) > 0:
-                    st.session_state['current_expenses'] = locked + res
-                    st.rerun()
+        cur_m_total, cur_y_total = 0, 0
+        for r in edited_c.to_dict('records'):
+            if str(r.get("Description", "")).strip() != "":
+                amt = safe_num(r.get("Amount ($)"))
+                if r.get("Frequency") == "Monthly":
+                    cur_m_total += amt
+                    cur_y_total += amt * 12
                 else:
-                    st.error("⚠️ AI returned an invalid format. Please try again.")
-    with col_sv_cb:
-        st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("💾 Save Budget", key="sv_4", use_container_width=True):
-            save_requested = True
-            st.toast("✅ Budget Saved!", icon="💾")
+                    cur_y_total += amt
+                    cur_m_total += amt / 12
+        render_total("Est. Total Baseline Budget", f"${cur_m_total:,.0f} / mo  |  ${cur_y_total:,.0f} / yr")
 
-    st.divider()
-    st.markdown("### Retirement Budget")
-    ret_city_state = st.session_state.get('retire_city_input', ud.get('retire_city', curr_city))
-    ret_city = city_autocomplete("Where will you retire? (Search any city globally)", "retire_city",
-                                 default_val=ret_city_state)
+        col_ai_cb, col_sv_cb = st.columns([3, 1])
+        with col_ai_cb:
+            st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
+            if st.button("✨ Auto-Estimate Budget for " + (curr_city if curr_city else "Your Area") + " (AI)",
+                         use_container_width=True):
+                with st.spinner("Analyzing localized CPI data and family needs..."):
+                    valid = edited_c[edited_c["Description"].astype(str) != ""].copy()
+                    locked = valid[valid["AI Estimate?"] == False].to_dict('records')
+                    locked_desc = [x['Description'] for x in locked]
+                    wealth_ctx = f"The household has a current annual pre-tax income of ${curr_inc_total:,.0f} and liquid assets totaling ${liq_ast_total:,.0f}. VERY IMPORTANT: While you should scale the budget to reflect this wealth, assume these users are savvy spenders and aggressive savers (comfortable but smart with money), so avoid over-inflating lifestyle costs unnecessarily."
+                    allowed_cats = ", ".join(budget_categories)
+                    prompt = f"City: {curr_city}. Family: {k_ctx} Housing: {h_ctx}. {wealth_ctx} Generate 10-15 missing living expenses to create a complete monthly budget. {ai_exclusion} Skip these items as they are already accounted for: {json.dumps(locked_desc)}. Return ONLY a JSON array of objects with keys: 'Description', 'Category' (MUST be exactly one of: {allowed_cats}. If unsure, default to 'Other'), 'Frequency' (Monthly/Yearly), 'Amount ($)' (number), 'AI Estimate?' (true)."
+                    res = call_gemini_json(prompt)
+                    if res and isinstance(res, list) and len(res) > 0:
+                        st.session_state['current_expenses'] = locked + res
+                        st.rerun()
+                    else:
+                        st.error("⚠️ AI returned an invalid format. Please try again.")
+        with col_sv_cb:
+            st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
+            if st.button("💾 Save Budget", key="sv_4", use_container_width=True):
+                save_requested = True
+                st.toast("✅ Budget Saved!", icon="💾")
 
-    df_r = pd.DataFrame(st.session_state['retire_expenses'])
-    if df_r.empty:
-        df_r = pd.DataFrame(
-            [{"Description": "Healthcare", "Category": "Healthcare", "Frequency": "Monthly", "Amount ($)": 0,
-              "AI Estimate?": False}])
-    else:
-        if "AI Estimate?" not in df_r.columns: df_r["AI Estimate?"] = False
-        df_r = df_r.reindex(columns=["Description", "Category", "Frequency", "Amount ($)", "AI Estimate?"])
+    with tab_ret:
+        ret_city_state = st.session_state.get('retire_city_input', ud.get('retire_city', curr_city))
+        ret_city = city_autocomplete("Where will you retire? (Search any city globally)", "retire_city",
+                                     default_val=ret_city_state)
 
-    edited_r = st.data_editor(
-        df_r,
-        column_config={
-            "Description": st.column_config.TextColumn("Description"),
-            "Category": st.column_config.SelectboxColumn("Category", options=budget_categories),
-            "Frequency": st.column_config.SelectboxColumn("Frequency", options=["Monthly", "Yearly"]),
-            "Amount ($)": st.column_config.NumberColumn("Amount ($)", step=100, format="$%d"),
-            "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI Estimate?")
-        }, num_rows="dynamic", width="stretch", hide_index=True, key="ret_exp_ed"
-    )
+        df_r = pd.DataFrame(st.session_state['retire_expenses'])
+        if df_r.empty:
+            df_r = pd.DataFrame(
+                [{"Description": "Healthcare", "Category": "Healthcare", "Frequency": "Monthly", "Amount ($)": 0,
+                  "AI Estimate?": False}])
+        else:
+            if "AI Estimate?" not in df_r.columns: df_r["AI Estimate?"] = False
+            df_r = df_r.reindex(columns=["Description", "Category", "Frequency", "Amount ($)", "AI Estimate?"])
 
-    ret_m_total, ret_y_total = 0, 0
-    for r in edited_r.to_dict('records'):
-        if str(r.get("Description", "")).strip() != "":
-            amt = safe_num(r.get("Amount ($)"))
-            if r.get("Frequency") == "Monthly":
-                ret_m_total += amt
-                ret_y_total += amt * 12
-            else:
-                ret_y_total += amt
-                ret_m_total += amt / 12
-    render_total("Est. Total Retirement Budget", f"${ret_m_total:,.0f} / mo  |  ${ret_y_total:,.0f} / yr")
+        edited_r = st.data_editor(
+            df_r,
+            column_config={
+                "Description": st.column_config.TextColumn("Description"),
+                "Category": st.column_config.SelectboxColumn("Category", options=budget_categories),
+                "Frequency": st.column_config.SelectboxColumn("Frequency", options=["Monthly", "Yearly"]),
+                "Amount ($)": st.column_config.NumberColumn("Amount ($)", step=100, format="$%d"),
+                "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI Estimate?")
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="ret_exp_ed"
+        )
 
-    col_ai_rb, col_sv_rb = st.columns([3, 1])
-    with col_ai_rb:
-        st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("✨ Simulate Realistic Lifestyle Costs in " + (ret_city if ret_city else "Retirement") + " (AI)",
-                     use_container_width=True):
-            with st.spinner(f"Modelling specific living costs for {ret_city}..."):
-                valid = edited_r[edited_r["Description"].astype(str) != ""].copy()
-                locked = valid[valid["AI Estimate?"] == False].to_dict('records')
-                locked_desc = [x['Description'] for x in locked]
-                wealth_ctx = f"The household will have a projected Net Worth built from a current income of ${curr_inc_total:,.0f} and current liquid assets of ${liq_ast_total:,.0f}. Assume a comfortable but smart, savvy-saver retirement lifestyle. Do not estimate overly extravagant expenses."
-                allowed_cats = ", ".join(budget_categories)
-                prompt = f"Retirement context: {ret_city}. Household size drops to {1 + (1 if has_spouse else 0)}. {wealth_ctx} Generate 10-15 missing living expenses to create a complete retirement budget. {ai_exclusion} Skip these items as they are already accounted for: {json.dumps(locked_desc)}. Return ONLY a JSON array of objects with keys: 'Description', 'Category' (MUST be exactly one of: {allowed_cats}. If unsure, default to 'Other'), 'Frequency' (Monthly/Yearly), 'Amount ($)' (number), 'AI Estimate?' (true)."
-                res = call_gemini_json(prompt)
-                if res and isinstance(res, list) and len(res) > 0:
-                    st.session_state['retire_expenses'] = locked + res
-                    st.rerun()
+        ret_m_total, ret_y_total = 0, 0
+        for r in edited_r.to_dict('records'):
+            if str(r.get("Description", "")).strip() != "":
+                amt = safe_num(r.get("Amount ($)"))
+                if r.get("Frequency") == "Monthly":
+                    ret_m_total += amt
+                    ret_y_total += amt * 12
                 else:
-                    st.error("⚠️ AI returned an invalid format. Please try again.")
-    with col_sv_rb:
-        st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("💾 Save Ret. Budget", key="sv_6", use_container_width=True):
-            save_requested = True
-            st.toast("✅ Ret. Budget Saved!", icon="💾")
+                    ret_y_total += amt
+                    ret_m_total += amt / 12
+        render_total("Est. Total Retirement Budget", f"${ret_m_total:,.0f} / mo  |  ${ret_y_total:,.0f} / yr")
+
+        col_ai_rb, col_sv_rb = st.columns([3, 1])
+        with col_ai_rb:
+            st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
+            if st.button(
+                    "✨ Simulate Realistic Lifestyle Costs in " + (ret_city if ret_city else "Retirement") + " (AI)",
+                    use_container_width=True):
+                with st.spinner(f"Modelling specific living costs for {ret_city}..."):
+                    valid = edited_r[edited_r["Description"].astype(str) != ""].copy()
+                    locked = valid[valid["AI Estimate?"] == False].to_dict('records')
+                    locked_desc = [x['Description'] for x in locked]
+                    wealth_ctx = f"The household will have a projected Net Worth built from a current income of ${curr_inc_total:,.0f} and current liquid assets of ${liq_ast_total:,.0f}. Assume a comfortable but smart, savvy-saver retirement lifestyle. Do not estimate overly extravagant expenses."
+                    allowed_cats = ", ".join(budget_categories)
+                    prompt = f"Retirement context: {ret_city}. Household size drops to {1 + (1 if has_spouse else 0)}. {wealth_ctx} Generate 10-15 missing living expenses to create a complete retirement budget. {ai_exclusion} Skip these items as they are already accounted for: {json.dumps(locked_desc)}. Return ONLY a JSON array of objects with keys: 'Description', 'Category' (MUST be exactly one of: {allowed_cats}. If unsure, default to 'Other'), 'Frequency' (Monthly/Yearly), 'Amount ($)' (number), 'AI Estimate?' (true)."
+                    res = call_gemini_json(prompt)
+                    if res and isinstance(res, list) and len(res) > 0:
+                        st.session_state['retire_expenses'] = locked + res
+                        st.rerun()
+                    else:
+                        st.error("⚠️ AI returned an invalid format. Please try again.")
+        with col_sv_rb:
+            st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
+            if st.button("💾 Save Ret. Budget", key="sv_6", use_container_width=True):
+                save_requested = True
+                st.toast("✅ Ret. Budget Saved!", icon="💾")
 
 # --- 5. MILESTONES ---
 with st.expander("🎉 5. AI Life Milestone Forecaster", expanded=False):
@@ -2024,7 +2031,8 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
             mc_runs = col_mc2.number_input("Number of Simulations", min_value=10, max_value=500, value=100, step=10)
 
             with col_mc3:
-                st.markdown('<div class="ai-btn-marker" style="height: 27px;"></div>', unsafe_allow_html=True)
+                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
                 if st.button("✨ Run Monte Carlo Simulation", use_container_width=True):
                     with st.spinner(f"Rendering {mc_runs} parallel market sequences..."):
                         success_count = 0
