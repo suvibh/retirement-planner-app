@@ -254,7 +254,8 @@ if 'assumptions' not in st.session_state: st.session_state['assumptions'] = ud.g
                                                                                                    "current_tax_rate": 5.0,
                                                                                                    "retire_tax_rate": 0.0,
                                                                                                    "roth_conversions": False,
-                                                                                                   "roth_target": "24%"})
+                                                                                                   "roth_target": "24%",
+                                                                                                   "withdrawal_strategy": "Standard"})
 
 
 def city_autocomplete(label, key_prefix, default_val=""):
@@ -494,7 +495,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
     st.divider()
     st.subheader("Liquid Savings & Investments")
     st.markdown(
-        '<div class="info-text">💡 <strong>Withdrawal Priority:</strong> The system always drains 1) Cash/Savings, then 2) Brokerage assets. Only after those are gone will it tap Traditional 401(k)s (applying Rule of 55 penalties if under age 55).</div>',
+        '<div class="info-text">💡 <strong>Withdrawal Priority:</strong> You can select your exact drawdown strategy (e.g. Standard vs Roth Preferred) in the "Advanced Scenarios" section below. The system always drains Cash and Brokerage assets before touching any retirement accounts.</div>',
         unsafe_allow_html=True)
     df_ast = pd.DataFrame(ud.get('liquid_assets', []))
     if df_ast.empty:
@@ -807,7 +808,7 @@ with st.expander("🔮 6. Global Macroeconomic Assumptions & Retirement Sim", ex
 # --- 7. ADVANCED SCENARIOS & TAXES ---
 with st.expander("⚖️ 7. AI Based Advanced Retirement Scenarios", expanded=False):
     st.markdown(
-        '<div class="info-text">💡 <strong>Tax Engine & Stress Tests:</strong> Our engine uses 2026 IRS tax brackets and dynamically calculates Federal, State, and FICA taxes. Real Estate income is intelligently taxed net of expenses and mortgage interest (Schedule E), and Business distributions include a simulated 20% Qualified Business Income (QBI) deduction. You can also stress-test your plan with things like a market crash or a long-term care event.</div>',
+        '<div class="info-text">💡 <strong>Tax Engine & Stress Tests:</strong> Our engine uses 2026 IRS tax brackets and dynamically calculates Federal, State, and FICA taxes. It also integrates Medicare IRMAA surcharges, Capital Gains Step-Up Basis on death, and Spousal Social Security survivor benefits.</div>',
         unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
@@ -844,7 +845,15 @@ with st.expander("⚖️ 7. AI Based Advanced Retirement Scenarios", expanded=Fa
                     st.rerun()
 
         st.divider()
-        st.write("**Tax Optimization**")
+        st.write("**Tax & Withdrawal Optimization**")
+
+        withdrawal_strategy = st.selectbox("Shortfall Withdrawal Sequence",
+                                           options=["Standard (Taxable -> 401k -> Roth)",
+                                                    "Roth Preferred (Taxable -> Roth -> 401k)"],
+                                           index=0 if "Standard" in st.session_state['assumptions'].get(
+                                               'withdrawal_strategy', 'Standard') else 1,
+                                           help="Determines which retirement accounts are drained first when your cash and taxable brokerages are empty.")
+
         roth_conversions = st.toggle("🔄 Enable Roth Conversion Optimizer",
                                      value=st.session_state['assumptions'].get('roth_conversions', False),
                                      help="Automatically converts Traditional 401(k) funds to Roth during low-income years to minimize lifetime RMD taxes. The AI will only convert what you can afford to pay taxes on out of your current cash/brokerage accounts.")
@@ -858,6 +867,8 @@ with st.expander("⚖️ 7. AI Based Advanced Retirement Scenarios", expanded=Fa
         save_requested = True
         st.session_state['assumptions']['roth_conversions'] = roth_conversions
         st.session_state['assumptions']['roth_target'] = roth_target
+        st.session_state['assumptions']['withdrawal_strategy'] = withdrawal_strategy.split(' ')[
+            0]  # Store just "Standard" or "Roth"
         st.toast("✅ Settings Saved!", icon="💾")
 
 # --- 8. EXHAUSTIVE DASHBOARD ENGINE & TAX LOGIC ---
@@ -866,6 +877,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
         prop_g = float(st.session_state['assumptions'].get('property_growth', 3.0))
         rent_g = float(st.session_state['assumptions'].get('rent_growth', 3.0))
+        active_withdrawal_strategy = st.session_state['assumptions'].get('withdrawal_strategy', 'Standard')
 
 
         # --- PROGRESSIVE IRS FEDERAL TAX CALCULATOR ---
@@ -1006,6 +1018,12 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
             sim_res, det_res, nw_det_res = [], [], []
             milestones_by_year = {}
 
+            # Drawdown trackers for dynamic milestones
+            tapped_brokerage = False
+            tapped_trad = False
+            tapped_roth = False
+            cash_depleted = False
+
             for year_offset in range(max_years + 1):
                 year = current_year + year_offset
                 my_current_age = year - my_birth_year
@@ -1054,13 +1072,17 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
                 active_mfj = True if has_spouse and is_my_alive and is_spouse_alive else False
 
+                # Capital Gains Step-Up Basis (Death of a spouse wipes out capital gains proxy tax)
+                brokerage_tax_rate = 0.05
+                if has_spouse and (not is_my_alive or not is_spouse_alive):
+                    brokerage_tax_rate = 0.0
+
                 # Income
+                primary_ss_amt = 0
+                spouse_ss_amt = 0
+
                 for inc in edited_inc.to_dict('records'):
                     owner = inc.get("Owner", "Me")
-                    if owner == "Me" and not is_my_alive: continue
-                    if owner == "Spouse" and not is_spouse_alive: continue
-                    if owner == "Joint" and not is_my_alive and not is_spouse_alive: continue
-
                     cat_name = inc.get("Category", "Other")
                     stop_at_ret = inc.get("Stop at Ret.?", False)
 
@@ -1084,33 +1106,51 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     if inc.get("Description") and is_active:
                         g = safe_num(inc.get('Override Growth (%)'), inc_g)
                         base_amt = safe_num(inc.get('Annual Amount ($)'))
+                        amt = base_amt * ((1 + g / 100) ** year_offset)
 
                         if cat_name == "Social Security":
                             if owner == "Me":
-                                base_amt = base_amt * my_ss_multi
+                                primary_ss_amt = amt * my_ss_multi
                             elif owner == "Spouse":
-                                base_amt = base_amt * spouse_ss_multi
+                                spouse_ss_amt = amt * spouse_ss_multi
+                            continue
 
-                        amt = base_amt * ((1 + g / 100) ** year_offset)
+                        # Hide 401(k) match from income completely, but it will still compound in the asset phase
+                        if cat_name == "Employer Match (401k/HSA)":
+                            continue
 
-                        # LOGGING: Track Match in Audit, but only add to spendable cash if NOT a match
+                        if owner == "Me" and not is_my_alive: continue
+                        if owner == "Spouse" and not is_spouse_alive: continue
+                        if owner == "Joint" and not is_my_alive and not is_spouse_alive: continue
+
+                        annual_inc += amt
                         yd[f"Income: {cat_name}"] = yd.get(f"Income: {cat_name}", 0) + amt
-                        if cat_name != "Employer Match (401k/HSA)":
-                            annual_inc += amt
-
-                        if cat_name == "Social Security": annual_ss += amt
-                        if cat_name not in ["Employer Match (401k/HSA)", "Social Security"]: pre_tax_ord += amt
+                        pre_tax_ord += amt
                         if cat_name in ["Base Salary (W-2)", "Bonus / Commission",
                                         "Contractor (1099)"]: earned_income += amt
+
+                # Spousal SS Survivor Benefits
+                active_ss = 0
+                if is_my_alive and is_spouse_alive:
+                    active_ss = primary_ss_amt + spouse_ss_amt
+                elif is_my_alive and not is_spouse_alive:
+                    active_ss = max(primary_ss_amt, spouse_ss_amt)
+                elif is_spouse_alive and not is_my_alive:
+                    active_ss = max(primary_ss_amt, spouse_ss_amt)
+
+                if active_ss > 0:
+                    annual_inc += active_ss
+                    annual_ss += active_ss
+                    yd["Income: Social Security"] = active_ss
 
                 # RMDs (Calculated individually)
                 rmd_income = 0
                 for a in sim_assets:
                     if a.get('Type') == 'Traditional 401k/IRA' and a['bal'] > 0:
                         owner = a.get('Owner', 'Me')
-                        owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
-                        owner_alive = is_my_alive if owner in ['Me', 'Joint'] else is_spouse_alive
-                        owner_rmd_age = primary_rmd_age if owner in ['Me', 'Joint'] else spouse_rmd_age
+                        owner_age = my_current_age if owner == 'Me' or owner == 'Joint' else spouse_current_age
+                        owner_alive = is_my_alive if owner == 'Me' or owner == 'Joint' else is_spouse_alive
+                        owner_rmd_age = primary_rmd_age if owner == 'Me' or owner == 'Joint' else spouse_rmd_age
 
                         if owner_alive and owner_age >= owner_rmd_age:
                             factor = irs_uniform_table.get(owner_age, 2.0)
@@ -1226,14 +1266,14 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                 total_exp += amt
                                 yd[f"Expense: Milestone ({desc})"] = amt
 
-                                # 529 Plan routing logic (Improved Two-Pass Fuzzy Matching)
+                                # 529 Plan routing logic (Improved Fuzzy Matching)
                                 is_education = any(k in desc.lower() for k in
                                                    ['college', 'tuition', 'university', 'education', 'school'])
                                 if is_education:
                                     amount_to_cover = amt
                                     covered_by_529 = 0
 
-                                    # Pass 1: Try to match child name specifically (Strips possessive 's)
+                                    # Pass 1: Try to match child name specifically (Strips possessives & punctuation)
                                     for a in sim_assets:
                                         if a.get('Type') == '529 Plan' and a['bal'] > 0:
                                             acct_name_clean = re.sub(r'[^a-zA-Z0-9\s]', '',
@@ -1314,18 +1354,9 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     a['growth']
                     a['bal'] *= (1 + a_growth / 100)
 
-                # Tax Calculations
+                # Tax Calculations Base
                 base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, 0, active_mfj, year_offset, infl)
                 state_tax_rate = cur_t if not is_retired else ret_t
-
-                # FICA Tax (Simplified approximation for earned income)
-                fica_tax = 0
-                if earned_income > 0:
-                    ss_wage_base = 168600 * ((1 + infl / 100) ** year_offset)
-                    ss_tax = min(earned_income, ss_wage_base) * 0.062
-                    med_tax = earned_income * 0.0145
-                    addl_med_tax = max(0, earned_income - 250000) * 0.009
-                    fica_tax = ss_tax + med_tax + addl_med_tax
 
                 # Roth Conversion Optimizer Guardrails
                 if roth_conversions and is_retired:
@@ -1387,7 +1418,48 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                             base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, 0, active_mfj, year_offset,
                                                                            infl)
 
+                # Medicare IRMAA Surcharges Proxy
+                num_on_medicare = 0
+                if is_my_alive and my_current_age >= 65: num_on_medicare += 1
+                if is_spouse_alive and spouse_current_age >= 65: num_on_medicare += 1
+
+                if num_on_medicare > 0:
+                    infl_factor = (1 + infl / 100) ** year_offset
+                    t1 = 206000 * infl_factor if active_mfj else 103000 * infl_factor
+                    t2 = 258000 * infl_factor if active_mfj else 129000 * infl_factor
+                    t3 = 322000 * infl_factor if active_mfj else 161000 * infl_factor
+                    t4 = 386000 * infl_factor if active_mfj else 193000 * infl_factor
+                    t5 = 750000 * infl_factor if active_mfj else 500000 * infl_factor
+
+                    surcharge = 0
+                    if pre_tax_ord > t5:
+                        surcharge = 6500 * infl_factor
+                    elif pre_tax_ord > t4:
+                        surcharge = 5500 * infl_factor
+                    elif pre_tax_ord > t3:
+                        surcharge = 4000 * infl_factor
+                    elif pre_tax_ord > t2:
+                        surcharge = 2500 * infl_factor
+                    elif pre_tax_ord > t1:
+                        surcharge = 1000 * infl_factor
+
+                    total_irmaa = surcharge * num_on_medicare
+                    if total_irmaa > 0:
+                        total_exp += total_irmaa
+                        yd["Expense: Medicare IRMAA Surcharge"] = total_irmaa
+
+                # Finalize Tax Setup
                 state_tax = pre_tax_ord * (state_tax_rate / 100.0)
+
+                # FICA Tax (Simplified approximation for earned income)
+                fica_tax = 0
+                if earned_income > 0:
+                    ss_wage_base = 168600 * ((1 + infl / 100) ** year_offset)
+                    ss_tax = min(earned_income, ss_wage_base) * 0.062
+                    med_tax = earned_income * 0.0145
+                    addl_med_tax = max(0, earned_income - 250000) * 0.009
+                    fica_tax = ss_tax + med_tax + addl_med_tax
+
                 total_tax = base_fed_tax + state_tax + fica_tax
 
                 # Robust Shortfall / Withdrawal Math
@@ -1396,17 +1468,29 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 net_cash_flow = annual_inc - cash_outflows
 
                 if net_cash_flow > 0:
-                    # Surplus
+                    # Surplus Handling & RMD Reinvestment
                     if unfunded_debt_bal > 0:
                         payoff = min(net_cash_flow, unfunded_debt_bal)
                         unfunded_debt_bal -= payoff
                         net_cash_flow -= payoff
                     if net_cash_flow > 0 and len(sim_assets) > 0:
-                        sim_assets[0]['bal'] += net_cash_flow
+                        brokerage_accts = [a for a in sim_assets if a.get('Type') == 'Brokerage (Taxable)']
+                        if brokerage_accts:
+                            brokerage_accts[0]['bal'] += net_cash_flow
+                        else:
+                            cash_accts = [a for a in sim_assets if
+                                          a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash']]
+                            if cash_accts:
+                                cash_accts[0]['bal'] += net_cash_flow
+                            else:
+                                sim_assets[0]['bal'] += net_cash_flow
                 elif net_cash_flow < 0:
                     shortfall = abs(net_cash_flow)
 
-                    # Sequence 1a: Checking/Savings/HYSA (0% Tax)
+                    # --- Sequence 1a: Checking/Savings/HYSA (0% Tax) ---
+                    cash_was_available = any(a['bal'] > 0 for a in sim_assets if
+                                             a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash'])
+
                     for a in sim_assets:
                         if shortfall <= 0: break
                         if a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash']:
@@ -1423,12 +1507,27 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                 shortfall -= a['bal']
                                 a['bal'] = 0
 
-                    # Sequence 1b: Taxable Brokerage (5% Tax on Gains Proxy)
+                    if shortfall > 0 and cash_was_available and not cash_depleted:
+                        cash_still_available = sum(a['bal'] for a in sim_assets if
+                                                   a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash'])
+                        if cash_still_available <= 0:
+                            if year not in milestones_by_year: milestones_by_year[year] = []
+                            milestones_by_year[year].append(
+                                {"desc": "⚠️ Cash Reserves Depleted", "amt": 0, "type": "system"})
+                            cash_depleted = True
+
+                    # --- Sequence 1b: Taxable Brokerage (5% Tax on Gains Proxy / Step-up Basis if deceased) ---
                     if shortfall > 0:
                         for a in sim_assets:
                             if shortfall <= 0: break
-                            if a.get('Type') == 'Brokerage (Taxable)':
-                                eff_tax = 0.05
+                            if a.get('Type') == 'Brokerage (Taxable)' and a['bal'] > 0:
+                                if not tapped_brokerage:
+                                    if year not in milestones_by_year: milestones_by_year[year] = []
+                                    milestones_by_year[year].append(
+                                        {"desc": "📉 Began Drawing from Taxable Brokerage", "amt": 0, "type": "system"})
+                                    tapped_brokerage = True
+
+                                eff_tax = brokerage_tax_rate
                                 req_gross = shortfall / (1.0 - eff_tax)
 
                                 if a['bal'] >= req_gross:
@@ -1448,76 +1547,176 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                     yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = withdrawn
                                     shortfall -= net_cash
 
-                    # Sequence 2: Tax-Deferred (Traditional 401k) - Rule of 55 check
-                    if shortfall > 0:
-                        for a in sim_assets:
-                            if shortfall <= 0: break
-                            if a.get('Type') == 'Traditional 401k/IRA':
-                                owner = a.get('Owner', 'Me')
-                                owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
-                                owner_retire_age = ret_age if owner in ['Me', 'Joint'] else (
-                                    s_ret_age if has_spouse else 9999)
+                    # Select logic based on Withdrawal Strategy
+                    if 'Standard' in active_withdrawal_strategy:
+                        # --- Sequence 2: Tax-Deferred (Traditional 401k) ---
+                        if shortfall > 0:
+                            for a in sim_assets:
+                                if shortfall <= 0: break
+                                if a.get('Type') == 'Traditional 401k/IRA' and a['bal'] > 0:
+                                    if not tapped_trad:
+                                        if year not in milestones_by_year: milestones_by_year[year] = []
+                                        milestones_by_year[year].append(
+                                            {"desc": "📉 Began Drawing from Traditional 401(k)/IRA", "amt": 0,
+                                             "type": "system"})
+                                        tapped_trad = True
 
-                                # Rule of 55: Penalty waived if retiring at 55 or later AND reaching that age
-                                rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
-                                penalty = 0.10 if (owner_age < 59.5 and not rule_of_55) else 0.0
+                                    owner = a.get('Owner', 'Me')
+                                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
+                                    owner_retire_age = ret_age if owner in ['Me', 'Joint'] else (
+                                        s_ret_age if has_spouse else 9999)
 
-                                eff_tax = min(marginal_rate + (state_tax_rate / 100.0) + penalty, 0.99)
-                                req_gross = shortfall / (1.0 - eff_tax)
+                                    # Rule of 55: Penalty waived if retiring at 55 or later AND reaching that age
+                                    rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
+                                    penalty = 0.10 if (owner_age < 59.5 and not rule_of_55) else 0.0
 
-                                if a['bal'] >= req_gross:
-                                    a['bal'] -= req_gross
-                                    tax_inc = req_gross - shortfall
-                                    total_tax += tax_inc
-                                    portfolio_income += req_gross
-                                    yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = req_gross
-                                    shortfall = 0
-                                else:
-                                    withdrawn = a['bal']
-                                    a['bal'] = 0
-                                    tax_inc = withdrawn * eff_tax
-                                    net_cash = withdrawn - tax_inc
-                                    total_tax += tax_inc
-                                    portfolio_income += withdrawn
-                                    yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = withdrawn
-                                    shortfall -= net_cash
+                                    eff_tax = min(marginal_rate + (state_tax_rate / 100.0) + penalty, 0.99)
+                                    req_gross = shortfall / (1.0 - eff_tax)
 
-                    # Sequence 3: Tax-Free (Roth/HSA) - Rule of 55 check
-                    if shortfall > 0:
-                        for a in sim_assets:
-                            if shortfall <= 0: break
-                            if a.get('Type') in ['Roth 401k/IRA', 'HSA', 'Crypto', '529 Plan', 'Other']:
-                                owner = a.get('Owner', 'Me')
-                                owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
-                                owner_retire_age = ret_age if owner in ['Me', 'Joint'] else (
-                                    s_ret_age if has_spouse else 9999)
+                                    if a['bal'] >= req_gross:
+                                        a['bal'] -= req_gross
+                                        tax_inc = req_gross - shortfall
+                                        total_tax += tax_inc
+                                        portfolio_income += req_gross
+                                        yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = req_gross
+                                        shortfall = 0
+                                    else:
+                                        withdrawn = a['bal']
+                                        a['bal'] = 0
+                                        tax_inc = withdrawn * eff_tax
+                                        net_cash = withdrawn - tax_inc
+                                        total_tax += tax_inc
+                                        portfolio_income += withdrawn
+                                        yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = withdrawn
+                                        shortfall -= net_cash
 
-                                # Rule of 55: Penalty waived if retiring at 55 or later
-                                rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
-                                penalty = 0.10 if (a.get(
-                                    'Type') == 'Roth 401k/IRA' and owner_age < 59.5 and not rule_of_55) else 0.0
+                        # --- Sequence 3: Tax-Free (Roth/HSA) ---
+                        if shortfall > 0:
+                            for a in sim_assets:
+                                if shortfall <= 0: break
+                                if a.get('Type') in ['Roth 401k/IRA', 'HSA', 'Crypto', '529 Plan', 'Other'] and a[
+                                    'bal'] > 0:
+                                    if not tapped_roth:
+                                        if year not in milestones_by_year: milestones_by_year[year] = []
+                                        milestones_by_year[year].append(
+                                            {"desc": "📉 Began Drawing from Roth/Tax-Free Assets", "amt": 0,
+                                             "type": "system"})
+                                        tapped_roth = True
 
-                                eff_tax = min(penalty, 0.99)
-                                req_gross = shortfall / (1.0 - eff_tax)
+                                    owner = a.get('Owner', 'Me')
+                                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
+                                    owner_retire_age = ret_age if owner in ['Me', 'Joint'] else (
+                                        s_ret_age if has_spouse else 9999)
 
-                                if a['bal'] >= req_gross:
-                                    a['bal'] -= req_gross
-                                    tax_inc = req_gross - shortfall
-                                    total_tax += tax_inc
-                                    portfolio_income += req_gross
-                                    yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = req_gross
-                                    shortfall = 0
-                                else:
-                                    withdrawn = a['bal']
-                                    a['bal'] = 0
-                                    tax_inc = withdrawn * eff_tax
-                                    net_cash = withdrawn - tax_inc
-                                    total_tax += tax_inc
-                                    portfolio_income += withdrawn
-                                    yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = withdrawn
-                                    shortfall -= net_cash
+                                    rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
+                                    penalty = 0.10 if (a.get(
+                                        'Type') == 'Roth 401k/IRA' and owner_age < 59.5 and not rule_of_55) else 0.0
 
-                    # Sequence 4: Complete Liquidity Failure -> Shortfall Debt
+                                    eff_tax = min(penalty, 0.99)
+                                    req_gross = shortfall / (1.0 - eff_tax)
+
+                                    if a['bal'] >= req_gross:
+                                        a['bal'] -= req_gross
+                                        tax_inc = req_gross - shortfall
+                                        total_tax += tax_inc
+                                        portfolio_income += req_gross
+                                        yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = req_gross
+                                        shortfall = 0
+                                    else:
+                                        withdrawn = a['bal']
+                                        a['bal'] = 0
+                                        tax_inc = withdrawn * eff_tax
+                                        net_cash = withdrawn - tax_inc
+                                        total_tax += tax_inc
+                                        portfolio_income += withdrawn
+                                        yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = withdrawn
+                                        shortfall -= net_cash
+
+                    else:
+                        # --- ROTH PREFERRED STRATEGY ---
+                        # --- Sequence 2: Tax-Free (Roth/HSA) ---
+                        if shortfall > 0:
+                            for a in sim_assets:
+                                if shortfall <= 0: break
+                                if a.get('Type') in ['Roth 401k/IRA', 'HSA', 'Crypto', '529 Plan', 'Other'] and a[
+                                    'bal'] > 0:
+                                    if not tapped_roth:
+                                        if year not in milestones_by_year: milestones_by_year[year] = []
+                                        milestones_by_year[year].append(
+                                            {"desc": "📉 Began Drawing from Roth/Tax-Free Assets", "amt": 0,
+                                             "type": "system"})
+                                        tapped_roth = True
+
+                                    owner = a.get('Owner', 'Me')
+                                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
+                                    owner_retire_age = ret_age if owner in ['Me', 'Joint'] else (
+                                        s_ret_age if has_spouse else 9999)
+
+                                    rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
+                                    penalty = 0.10 if (a.get(
+                                        'Type') == 'Roth 401k/IRA' and owner_age < 59.5 and not rule_of_55) else 0.0
+
+                                    eff_tax = min(penalty, 0.99)
+                                    req_gross = shortfall / (1.0 - eff_tax)
+
+                                    if a['bal'] >= req_gross:
+                                        a['bal'] -= req_gross
+                                        tax_inc = req_gross - shortfall
+                                        total_tax += tax_inc
+                                        portfolio_income += req_gross
+                                        yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = req_gross
+                                        shortfall = 0
+                                    else:
+                                        withdrawn = a['bal']
+                                        a['bal'] = 0
+                                        tax_inc = withdrawn * eff_tax
+                                        net_cash = withdrawn - tax_inc
+                                        total_tax += tax_inc
+                                        portfolio_income += withdrawn
+                                        yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = withdrawn
+                                        shortfall -= net_cash
+
+                        # --- Sequence 3: Tax-Deferred (Traditional 401k) ---
+                        if shortfall > 0:
+                            for a in sim_assets:
+                                if shortfall <= 0: break
+                                if a.get('Type') == 'Traditional 401k/IRA' and a['bal'] > 0:
+                                    if not tapped_trad:
+                                        if year not in milestones_by_year: milestones_by_year[year] = []
+                                        milestones_by_year[year].append(
+                                            {"desc": "📉 Began Drawing from Traditional 401(k)/IRA", "amt": 0,
+                                             "type": "system"})
+                                        tapped_trad = True
+
+                                    owner = a.get('Owner', 'Me')
+                                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
+                                    owner_retire_age = ret_age if owner in ['Me', 'Joint'] else (
+                                        s_ret_age if has_spouse else 9999)
+
+                                    rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
+                                    penalty = 0.10 if (owner_age < 59.5 and not rule_of_55) else 0.0
+
+                                    eff_tax = min(marginal_rate + (state_tax_rate / 100.0) + penalty, 0.99)
+                                    req_gross = shortfall / (1.0 - eff_tax)
+
+                                    if a['bal'] >= req_gross:
+                                        a['bal'] -= req_gross
+                                        tax_inc = req_gross - shortfall
+                                        total_tax += tax_inc
+                                        portfolio_income += req_gross
+                                        yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = req_gross
+                                        shortfall = 0
+                                    else:
+                                        withdrawn = a['bal']
+                                        a['bal'] = 0
+                                        tax_inc = withdrawn * eff_tax
+                                        net_cash = withdrawn - tax_inc
+                                        total_tax += tax_inc
+                                        portfolio_income += withdrawn
+                                        yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = withdrawn
+                                        shortfall -= net_cash
+
+                    # --- Sequence 4: Complete Liquidity Failure -> Shortfall Debt ---
                     if shortfall > 0:
                         unfunded_debt_bal += shortfall
 
@@ -1527,11 +1726,13 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 if unfunded_debt_bal > 0 and prev_unfunded_debt_bal == 0:
                     if year not in milestones_by_year: milestones_by_year[year] = []
                     milestones_by_year[year].append(
-                        {"desc": "🚨 MAJOR SHORTFALL: Cash Depleted!", "amt": unfunded_debt_bal, "type": "critical"})
+                        {"desc": "🚨 MAJOR SHORTFALL: Retirement Accounts Depleted!", "amt": unfunded_debt_bal,
+                         "type": "critical"})
                 prev_unfunded_debt_bal = unfunded_debt_bal
 
                 liquid_assets_total = 0
                 for a in sim_assets:
+                    # Ensure no floating point math drags balance below absolute zero
                     a['bal'] = max(0, a['bal'])
                     liquid_assets_total += a['bal']
                     nw_yd[f"Asset: {a.get('Account Name', 'Account')}"] = a['bal']
@@ -1874,7 +2075,8 @@ if st.button("🚀 Save Full Profile to Cloud Server", type="primary", use_conta
             "assumptions": {**st.session_state['assumptions'], "inflation": infl, "inflation_healthcare": infl_hc,
                             "inflation_education": infl_ed, "market_growth": mkt, "income_growth": inc_g,
                             "property_growth": prop_g, "rent_growth": rent_g, "current_tax_rate": cur_t,
-                            "retire_tax_rate": ret_t, "roth_conversions": roth_conversions, "roth_target": roth_target}
+                            "retire_tax_rate": ret_t, "roth_conversions": roth_conversions, "roth_target": roth_target,
+                            "withdrawal_strategy": withdrawal_strategy.split(' ')[0]}
         }
         db.collection('users').document(st.session_state['user_email']).set(user_data, merge=True)
         st.session_state['user_data'] = user_data
