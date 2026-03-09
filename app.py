@@ -391,6 +391,7 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
             res = call_gemini_json(prompt)
             if res:
                 current_inc = df_inc.to_dict('records')
+                # Primary SS automatically starts at their FRA year defaults (can be adjusted)
                 if 'ss_amount_me' in res:
                     current_inc.append(
                         {"Description": "Estimated Social Security (Primary)", "Category": "Social Security",
@@ -654,7 +655,7 @@ with st.expander("💸 4. Current Budget & Expenses", expanded=False):
 # --- 5. MILESTONES ---
 with st.expander("🎉 5. AI Life Milestone Forecaster", expanded=False):
     st.markdown(
-        '<div class="info-text">💡 <strong>Multi-Year Events & 529s:</strong> Ensure you set an End Date for events that span multiple years (like a 4-year degree). The engine will automatically drain any 529 Plans first to pay for expenses with "College" or "Tuition" in the description!</div>',
+        '<div class="info-text">💡 <strong>Multi-Year Events & 529s:</strong> Ensure you set an End Date for events that span multiple years (like a 4-year degree). The engine will automatically drain any 529 Plans first to pay for expenses with "College", "School" or "Tuition" in the description!</div>',
         unsafe_allow_html=True)
     df_m = pd.DataFrame(st.session_state['one_time_events'])
     current_date_str = f"{datetime.date.today().month:02d}/{datetime.date.today().year}"
@@ -1001,6 +1002,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
             sim_biz = copy.deepcopy(base_sim_biz)
 
             unfunded_debt_bal = 0
+            prev_unfunded_debt_bal = 0
             sim_res, det_res, nw_det_res = [], [], []
             milestones_by_year = {}
 
@@ -1014,6 +1016,23 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
                 if not is_my_alive and not is_spouse_alive:
                     break
+
+                # System Milestones Logic
+                if year == primary_retire_year and is_my_alive:
+                    if year not in milestones_by_year: milestones_by_year[year] = []
+                    milestones_by_year[year].append({"desc": "🎓 You Retire", "amt": 0, "type": "system"})
+
+                if has_spouse and year == spouse_retire_year and is_spouse_alive:
+                    if year not in milestones_by_year: milestones_by_year[year] = []
+                    milestones_by_year[year].append({"desc": "🎓 Spouse Retires", "amt": 0, "type": "system"})
+
+                if is_my_alive and my_current_age == primary_rmd_age:
+                    if year not in milestones_by_year: milestones_by_year[year] = []
+                    milestones_by_year[year].append({"desc": "🏦 Your RMDs Begin", "amt": 0, "type": "system"})
+
+                if has_spouse and is_spouse_alive and spouse_current_age == spouse_rmd_age:
+                    if year not in milestones_by_year: milestones_by_year[year] = []
+                    milestones_by_year[year].append({"desc": "🏦 Spouse RMDs Begin", "amt": 0, "type": "system"})
 
                 is_retired = year >= primary_retire_year
                 is_spouse_retired = has_spouse and (year >= spouse_retire_year)
@@ -1116,6 +1135,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     if year_offset > 0: r['rent'] *= (1 + r['r_growth'] / 100); r['exp'] *= (1 + infl / 100); r[
                         'val'] *= (1 + r['v_growth'] / 100)
                     annual_inc += r['rent']
+                    pre_tax_ord += r['rent']
                     yd["Income: RE Rent"] = r['rent'] if r['rent'] > 0 else 0
                     re_exp_total += r['exp']
                     yd["Expense: RE Upkeep/Tax"] = r['exp'] if r['exp'] > 0 else 0
@@ -1197,7 +1217,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                             amt = base_amt * ((1 + infl / 100) ** year_offset)
 
                             if year not in milestones_by_year: milestones_by_year[year] = []
-                            milestones_by_year[year].append({"desc": desc, "amt": amt})
+                            milestones_by_year[year].append({"desc": desc, "amt": amt, "type": "normal"})
 
                             if ev.get('Type') == 'Expense':
                                 total_exp += amt
@@ -1213,9 +1233,19 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                     # Pass 1: Try to match child name specifically
                                     for a in sim_assets:
                                         if a.get('Type') == '529 Plan' and a['bal'] > 0:
-                                            acct_words = [w.lower() for w in str(a.get('Account Name', '')).split() if
-                                                          len(w) > 2]
-                                            if any(w in desc.lower() for w in acct_words):
+                                            acct_name_clean = re.sub(r'[^a-zA-Z0-9\s]', '',
+                                                                     str(a.get('Account Name', ''))).lower()
+                                            desc_clean = re.sub(r'[^a-zA-Z0-9\s]', '', desc).lower()
+                                            acct_words = [w for w in acct_name_clean.split() if
+                                                          len(w) > 3 and w not in ['plan', 'account', '529']]
+
+                                            match = False
+                                            for w in acct_words:
+                                                if w in desc_clean:
+                                                    match = True
+                                                    break
+
+                                            if match:
                                                 if a['bal'] >= amount_to_cover:
                                                     a['bal'] -= amount_to_cover
                                                     covered_by_529 += amount_to_cover
@@ -1415,6 +1445,13 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     if shortfall > 0:
                         unfunded_debt_bal += shortfall
 
+                # Check for Critical Shortfall Alert
+                if unfunded_debt_bal > 0 and prev_unfunded_debt_bal == 0:
+                    if year not in milestones_by_year: milestones_by_year[year] = []
+                    milestones_by_year[year].append(
+                        {"desc": "🚨 MAJOR SHORTFALL: Cash Depleted!", "amt": unfunded_debt_bal, "type": "critical"})
+                prev_unfunded_debt_bal = unfunded_debt_bal
+
                 liquid_assets_total = 0
                 for a in sim_assets:
                     # Ensure no floating point math drags balance below absolute zero
@@ -1525,18 +1562,40 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
             if HAS_PLOTLY:
                 # Pre-calculate Milestone Chart Markers
-                m_years = []
-                m_texts = []
-                m_y_nw = []
+                m_x_normal, m_y_normal, m_text_normal = [], [], []
+                m_x_system, m_y_system, m_text_system = [], [], []
+                m_x_alert, m_y_alert, m_text_alert = [], [], []
+
                 if run_milestones:
                     m_years = sorted(list(run_milestones.keys()))
                     for y in m_years:
-                        discount = (1 + infl / 100) ** (y - current_year) if view_todays_dollars else 1.0
-                        texts = [f"• {m['desc']} (${m['amt'] / discount:,.0f})" for m in run_milestones[y]]
-                        m_texts.append(f"<b>Year {y} Milestones:</b><br>" + "<br>".join(texts))
-
                         row = df_sim[df_sim['Year'] == y]
-                        m_y_nw.append(row['Net Worth'].values[0] if not row.empty else 0)
+                        nw_val = row['Net Worth'].values[0] if not row.empty else 0
+
+                        events = run_milestones[y]
+                        normals = [e for e in events if e.get('type') == 'normal']
+                        systems = [e for e in events if e.get('type') == 'system']
+                        alerts = [e for e in events if e.get('type') == 'critical']
+
+                        discount = (1 + infl / 100) ** (y - current_year) if view_todays_dollars else 1.0
+
+                        if normals:
+                            texts = [f"• {m['desc']} (${m['amt'] / discount:,.0f})" for m in normals]
+                            m_x_normal.append(y)
+                            m_y_normal.append(nw_val)
+                            m_text_normal.append(f"<b>Year {y}:</b><br>" + "<br>".join(texts))
+
+                        if systems:
+                            texts = [f"• {m['desc']}" for m in systems]
+                            m_x_system.append(y)
+                            m_y_system.append(nw_val)
+                            m_text_system.append(f"<b>System Event ({y}):</b><br>" + "<br>".join(texts))
+
+                        if alerts:
+                            texts = [f"• {m['desc']}" for m in alerts]
+                            m_x_alert.append(y)
+                            m_y_alert.append(nw_val)
+                            m_text_alert.append(f"<b>⚠️ ALERT ({y}):</b><br>" + "<br>".join(texts))
 
                 st.write("#### Net Worth Composition (Smart Asset Drawdown)")
                 fig_nw = go.Figure()
@@ -1557,11 +1616,22 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     go.Scatter(x=df_sim["Year"], y=df_sim["Net Worth"], mode='lines', name='Total Net Worth',
                                line=dict(color='#111827', width=3, dash='dot')))
 
-                if m_years:
-                    fig_nw.add_trace(go.Scatter(x=m_years, y=m_y_nw, mode='markers',
+                # Overlay Milestone Markers
+                if m_x_normal:
+                    fig_nw.add_trace(go.Scatter(x=m_x_normal, y=m_y_normal, mode='markers',
                                                 marker=dict(symbol='star', size=14, color='#eab308',
-                                                            line=dict(width=1.5, color='white')), name='Milestones',
-                                                hoverinfo='text', text=m_texts))
+                                                            line=dict(width=1.5, color='white')),
+                                                name='User Milestones', hoverinfo='text', text=m_text_normal))
+                if m_x_system:
+                    fig_nw.add_trace(go.Scatter(x=m_x_system, y=m_y_system, mode='markers',
+                                                marker=dict(symbol='star', size=14, color='#3b82f6',
+                                                            line=dict(width=1.5, color='white')), name='System Events',
+                                                hoverinfo='text', text=m_text_system))
+                if m_x_alert:
+                    fig_nw.add_trace(go.Scatter(x=m_x_alert, y=m_y_alert, mode='markers',
+                                                marker=dict(symbol='star', size=18, color='#ef4444',
+                                                            line=dict(width=2, color='white')), name='Critical Alerts',
+                                                hoverinfo='text', text=m_text_alert))
 
                 fig_nw.update_layout(hovermode="x unified", yaxis=dict(tickformat="$,.0f"),
                                      margin=dict(l=0, r=0, t=30, b=0),
@@ -1581,11 +1651,22 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     go.Scatter(x=df_sim["Year"], y=df_sim["Annual Net Savings"], mode='lines', name='Net Cashflow',
                                line=dict(color='#10b981', width=3, dash='dot')))
 
-                if m_years:
-                    fig_cf.add_trace(go.Scatter(x=m_years, y=[0] * len(m_years), mode='markers',
+                # Overlay Milestone Markers
+                if m_x_normal:
+                    fig_cf.add_trace(go.Scatter(x=m_x_normal, y=[0] * len(m_x_normal), mode='markers',
                                                 marker=dict(symbol='star', size=14, color='#eab308',
-                                                            line=dict(width=1.5, color='white')), name='Milestones',
-                                                hoverinfo='text', text=m_texts))
+                                                            line=dict(width=1.5, color='white')),
+                                                name='User Milestones', hoverinfo='text', text=m_text_normal))
+                if m_x_system:
+                    fig_cf.add_trace(go.Scatter(x=m_x_system, y=[0] * len(m_x_system), mode='markers',
+                                                marker=dict(symbol='star', size=14, color='#3b82f6',
+                                                            line=dict(width=1.5, color='white')), name='System Events',
+                                                hoverinfo='text', text=m_text_system))
+                if m_x_alert:
+                    fig_cf.add_trace(go.Scatter(x=m_x_alert, y=[0] * len(m_x_alert), mode='markers',
+                                                marker=dict(symbol='star', size=18, color='#ef4444',
+                                                            line=dict(width=2, color='white')), name='Critical Alerts',
+                                                hoverinfo='text', text=m_text_alert))
 
                 fig_cf.update_layout(hovermode="x unified", yaxis=dict(tickformat="$,.0f"),
                                      margin=dict(l=0, r=0, t=30, b=0),
