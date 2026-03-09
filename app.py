@@ -34,7 +34,7 @@ st.markdown("""
     div[data-testid="column"]:has(button:contains("✨")) button { background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%) !important; color: white !important; border: none !important; font-weight: 600 !important; box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.39) !important; }
     div[data-testid="column"]:has(button:contains("✨")) button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.39) !important; }
     [data-testid="stMetricValue"] { font-size: 1.8rem !important; font-weight: 700 !important; color: #4f46e5 !important; }
-    .info-text { font-size: 0.95rem; color: #334155; margin-bottom: 15px; border-left: 4px solid #3b82f6; padding-left: 12px; background-color: #eff6ff; padding-top: 12px; padding-bottom: 12px; padding-right: 10px; border-radius: 0 8px 8px 0; line-height: 1.5;}
+    .info-text { font-size: 0.95rem; color: #334155; margin-bottom: 15px; border-left: 4px solid #3b82f6; padding-left: 12px; background-color: #eff6ff; padding: 10px; padding-bottom: 12px; padding-right: 10px; border-radius: 0 8px 8px 0; line-height: 1.5;}
 
     [data-testid="stMetricValue"] { font-size: 1.6rem !important; }
     [data-testid="stMetricLabel"] { font-weight: 600 !important; color: #475569 !important; }
@@ -656,7 +656,7 @@ with st.expander("💸 4. Current Budget & Expenses", expanded=False):
 # --- 5. MILESTONES ---
 with st.expander("🎉 5. AI Life Milestone Forecaster", expanded=False):
     st.markdown(
-        '<div class="info-text">💡 Add descriptions like <em>"College for Sarah"</em> or <em>"Kitchen Remodel"</em>. The AI calculates exact future start years based on current family ages.</div>',
+        '<div class="info-text">💡 <strong>Multi-Year Events & 529s:</strong> Ensure you set an End Date for events that span multiple years (like a 4-year degree). The engine will automatically drain any 529 Plans first to pay for expenses with "College" or "Tuition" in the description!</div>',
         unsafe_allow_html=True)
     df_m = pd.DataFrame(st.session_state['one_time_events'])
     current_date_str = f"{datetime.date.today().month:02d}/{datetime.date.today().year}"
@@ -688,7 +688,7 @@ with st.expander("🎉 5. AI Life Milestone Forecaster", expanded=False):
     if st.button("✨ Forecast Milestone Timelines & Costs (AI)"):
         with st.spinner("AI is mapping out your timeline and projecting future costs..."):
             valid = edited_m[edited_m["Description"].astype(str) != ""].to_dict('records')
-            prompt = f"Family Context: {f_ctx}. Current Date: {current_date_str}. Calculate Start/End dates (MM/YYYY) and future Amounts in today's dollars for: {json.dumps(valid)}. Return ONLY JSON array."
+            prompt = f"Family Context: {f_ctx}. Current Date: {current_date_str}. Calculate Start/End dates (MM/YYYY) and future Amounts in today's dollars for: {json.dumps(valid)}. Note: For multi-year events like College, ensure the End Date correctly reflects the duration (e.g. 4 years later). Return ONLY a JSON array."
             res = call_gemini_json(prompt)
             if res and isinstance(res, list):
                 st.session_state['one_time_events'] = res
@@ -808,7 +808,7 @@ with st.expander("🔮 6. Global Macroeconomic Assumptions & Retirement Sim", ex
 # --- 7. ADVANCED SCENARIOS & TAXES ---
 with st.expander("⚖️ 7. AI Based Advanced Retirement Scenarios", expanded=False):
     st.markdown(
-        '<div class="info-text">💡 Adjust edge-case scenarios here. The simulation integrates Federal Taxes dynamically using 2026 Brackets. Input your effective State Tax here.</div>',
+        '<div class="info-text">💡 <strong>Tax Engine & Stress Tests:</strong> Our engine uses 2026 IRS tax brackets and dynamically calculates Federal, State, and FICA taxes. Real Estate income is intelligently taxed net of expenses and mortgage interest (Schedule E), and Business distributions include a simulated 20% Qualified Business Income (QBI) deduction. You can also stress-test your plan with things like a market crash or a long-term care event.</div>',
         unsafe_allow_html=True)
 
     col1, col2 = st.columns(2)
@@ -829,7 +829,7 @@ with st.expander("⚖️ 7. AI Based Advanced Retirement Scenarios", expanded=Fa
         st.write("**State Tax / Effective Adjustments**")
         cur_t = st.number_input("Current State Tax Adjustment (%)",
                                 value=float(st.session_state['assumptions'].get('current_tax_rate', 5.0)),
-                                help="Federal taxes are calculated dynamically. Enter your effective State/Local rate here.")
+                                help="ONLY enter your effective State/Local rate here. Do NOT include Federal Tax, as the engine calculates Federal dynamically.")
         ret_t = st.number_input("Retirement State Tax Adjustment (%)",
                                 value=float(st.session_state['assumptions'].get('retire_tax_rate', 0.0)),
                                 help="Are you moving to a tax-free state in retirement? Adjust here.")
@@ -1105,24 +1105,30 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                         b['dist'] *= (1 + b['d_growth'] / 100)
                     cur_biz_val += (b['val'] * b['own'])
                     annual_inc += b['dist']
-                    pre_tax_ord += b['dist']
+                    # QBI Deduction Proxy: ~20% of business pass-through income is generally tax-deductible in the US
+                    pre_tax_ord += (b['dist'] * 0.80)
                     yd["Income: Biz Dist"] = b['dist']
 
                 for r in sim_re:
                     if year_offset > 0: r['rent'] *= (1 + r['r_growth'] / 100); r['exp'] *= (1 + infl / 100); r[
                         'val'] *= (1 + r['v_growth'] / 100)
                     annual_inc += r['rent']
-                    pre_tax_ord += r['rent']
                     yd["Income: RE Rent"] = r['rent'] if r['rent'] > 0 else 0
                     re_exp_total += r['exp']
                     yd["Expense: RE Upkeep/Tax"] = r['exp'] if r['exp'] > 0 else 0
+
+                    interest_paid = 0
                     if r['debt'] > 0:
-                        interest = r['debt'] * r['rate']
-                        principal = max(0, r['pmt'] - interest)
+                        interest_paid = r['debt'] * r['rate']
+                        principal = max(0, r['pmt'] - interest_paid)
                         r['debt'] = max(0, r['debt'] - principal)
                         re_exp_total += r['pmt']
                         yd["Expense: RE Mortgage"] = r['pmt']
                     re_equity += (r['val'] - r['debt'])
+
+                    # Schedule E Proxy: Real Estate is taxed on NET income, not gross.
+                    taxable_rent = max(0, r['rent'] - r['exp'] - interest_paid)
+                    pre_tax_ord += taxable_rent
 
                 # Core Expenses & Toggles
                 total_exp = re_exp_total
@@ -1163,19 +1169,56 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 # Milestones
                 for ev in edited_m.to_dict('records'):
                     if ev.get("Description"):
+                        desc = str(ev.get("Description", ""))
                         try:
                             sy = int(str(ev.get('Start Date (MM/YYYY)', '')).split('/')[-1])
                         except:
                             sy = 0
-                        if sy == year and sy != 0:
-                            amt = safe_num(ev.get('Amount ($)')) * ((1 + infl / 100) ** year_offset)
+
+                        try:
+                            ey = int(str(ev.get('End Date (MM/YYYY)', '')).split('/')[-1])
+                        except:
+                            ey = sy
+
+                        freq = ev.get('Frequency', 'One-Time')
+                        if freq == 'One-Time':
+                            ey = sy
+
+                        if sy <= year <= ey and sy != 0:
+                            base_amt = safe_num(ev.get('Amount ($)'))
+                            if freq == 'Monthly':
+                                base_amt *= 12
+
+                            amt = base_amt * ((1 + infl / 100) ** year_offset)
+
                             if ev.get('Type') == 'Expense':
                                 total_exp += amt
-                                yd[f"Expense: Milestone ({ev.get('Description')})"] = amt
+                                yd[f"Expense: Milestone ({desc})"] = amt
+
+                                # 529 Plan routing logic
+                                is_education = any(k in desc.lower() for k in
+                                                   ['college', 'tuition', 'university', 'education', 'school'])
+                                if is_education:
+                                    amount_to_cover = amt
+                                    covered_by_529 = 0
+                                    for a in sim_assets:
+                                        if a.get('Type') == '529 Plan' and a['bal'] > 0:
+                                            if a['bal'] >= amount_to_cover:
+                                                a['bal'] -= amount_to_cover
+                                                covered_by_529 += amount_to_cover
+                                                amount_to_cover = 0
+                                                break
+                                            else:
+                                                amount_to_cover -= a['bal']
+                                                covered_by_529 += a['bal']
+                                                a['bal'] = 0
+                                    if covered_by_529 > 0:
+                                        annual_inc += covered_by_529
+                                        yd[f"Income: Tax-Free 529 Withdrawal ({desc})"] = covered_by_529
                             else:
                                 annual_inc += amt
                                 pre_tax_ord += amt
-                                yd[f"Income: Milestone ({ev.get('Description')})"] = amt
+                                yd[f"Income: Milestone ({desc})"] = amt
 
                 # Asset Waterfall Routing
                 liquid_assets_total, asset_contributions = 0, 0
