@@ -806,22 +806,7 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
                                  int(p_info.get('spouse_life_exp', 95))) if has_spouse else None
 
     # --- ASSUMPTIONS BLOCK ---
-    with st.container():
-        st.markdown("""
-        <style>
-        .assumption-card {
-            background-color: white;
-            border: 1px solid #e2e8f0;
-            border-radius: 12px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-        }
-        </style>
-        <div class="assumption-card">
-        """, unsafe_allow_html=True)
-
-        st.markdown("#### 📊 Macroeconomic & Tax Assumptions")
+    with st.expander("📊 Macroeconomic & Tax Assumptions", expanded=False):
         st.markdown(
             '<div class="info-text">💡 <strong>AI Estimation:</strong> Click the ✨ AI button next to any field to have the AI estimate a realistic, localized value based on historical data and your profile!</div>',
             unsafe_allow_html=True)
@@ -843,12 +828,17 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
                 if sub_c2.button("✨ AI", key=f"btn_{state_key}", help=f"AI Estimate for {label}",
                                  use_container_width=True):
                     with st.spinner("AI estimating..."):
-                        res = call_gemini_json(prompt)
+                        enhanced_prompt = prompt + " CRITICAL INSTRUCTION: You MUST return the value as a percentage number between 0 and 100 (e.g., return 5.5 for 5.5%, DO NOT return 0.055)."
+                        res = call_gemini_json(enhanced_prompt)
                         if res and state_key in res:
                             new_val = float(res[state_key])
+                            # Failsafe for rogue AI formatting (if it still returns 0.04 instead of 4.0)
+                            if 0 < new_val < 0.30:
+                                new_val *= 100.0
                             st.session_state['assumptions'][state_key] = new_val
                             # Safe state injection before widget initialization
                             st.session_state[widget_key] = new_val
+                            st.rerun()
 
                 if widget_key not in st.session_state:
                     st.session_state[widget_key] = float(st.session_state['assumptions'].get(state_key, default_val))
@@ -896,8 +886,6 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
         if st.button("💾 Save Assumptions", key="sv_assumptions", use_container_width=True):
             save_requested = True
             st.toast("✅ Assumptions Saved!", icon="💾")
-
-        st.markdown("</div>", unsafe_allow_html=True)
 
     with st.expander("⚙️ Advanced Scenarios & Tax Optimization", expanded=False):
         st.markdown(
