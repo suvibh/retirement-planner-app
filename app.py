@@ -827,7 +827,7 @@ with st.expander("⚖️ 7. AI Based Advanced Retirement Scenarios", expanded=Fa
     with col2:
         st.write("**State Tax / Effective Adjustments**")
         cur_t = st.number_input("Current State Tax Adjustment (%)",
-                                value=float(st.session_state['assumptions'].get('current_tax_rate', 5.0)),
+                                value=float(st.session_state['assumptions'].get('current_tax_rate', 4.0)),
                                 help="ONLY enter your effective State/Local rate here. Do NOT include Federal Tax, as the engine calculates Federal dynamically.")
         ret_t = st.number_input("Retirement State Tax Adjustment (%)",
                                 value=float(st.session_state['assumptions'].get('retire_tax_rate', 0.0)),
@@ -847,7 +847,7 @@ with st.expander("⚖️ 7. AI Based Advanced Retirement Scenarios", expanded=Fa
         st.write("**Tax Optimization**")
         roth_conversions = st.toggle("🔄 Enable Roth Conversion Optimizer",
                                      value=st.session_state['assumptions'].get('roth_conversions', False),
-                                     help="Automatically converts Traditional 401(k) funds to Roth during low-income years to minimize lifetime RMD taxes.")
+                                     help="Automatically converts Traditional 401(k) funds to Roth during low-income years to minimize lifetime RMD taxes. The AI will only convert what you can afford to pay taxes on out of your current cash/brokerage accounts.")
         roth_target_idx = ["12%", "22%", "24%", "32%"].index(st.session_state['assumptions'].get('roth_target', "24%"))
         roth_target = st.selectbox("Target Bracket to Fill", options=["12%", "22%", "24%", "32%"],
                                    index=roth_target_idx,
@@ -1135,7 +1135,6 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     if year_offset > 0: r['rent'] *= (1 + r['r_growth'] / 100); r['exp'] *= (1 + infl / 100); r[
                         'val'] *= (1 + r['v_growth'] / 100)
                     annual_inc += r['rent']
-                    pre_tax_ord += r['rent']
                     yd["Income: RE Rent"] = r['rent'] if r['rent'] > 0 else 0
                     re_exp_total += r['exp']
                     yd["Expense: RE Upkeep/Tax"] = r['exp'] if r['exp'] > 0 else 0
@@ -1309,7 +1308,20 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     a['growth']
                     a['bal'] *= (1 + a_growth / 100)
 
-                # Roth Conversion Optimizer
+                # Tax Calculations
+                base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, 0, active_mfj, year_offset, infl)
+                state_tax_rate = cur_t if not is_retired else ret_t
+
+                # FICA Tax (Simplified approximation for earned income)
+                fica_tax = 0
+                if earned_income > 0:
+                    ss_wage_base = 168600 * ((1 + infl / 100) ** year_offset)
+                    ss_tax = min(earned_income, ss_wage_base) * 0.062
+                    med_tax = earned_income * 0.0145
+                    addl_med_tax = max(0, earned_income - 250000) * 0.009
+                    fica_tax = ss_tax + med_tax + addl_med_tax
+
+                # Roth Conversion Optimizer Guardrails
                 if roth_conversions and is_retired:
                     infl_factor = (1 + infl / 100) ** year_offset
                     std_deduction = (29200 if active_mfj else 14600) * infl_factor
@@ -1322,6 +1334,16 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     target_max_income = target_limit + std_deduction
 
                     conversion_room = max(0, target_max_income - pre_tax_ord)
+
+                    # GUARDRAIL: Only convert what can be comfortably paid by existing liquid cash
+                    available_cash = sum(a['bal'] for a in sim_assets if
+                                         a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)',
+                                                           'Unallocated Cash'])
+                    est_tax_rate = marginal_rate + (state_tax_rate / 100.0)
+                    max_tax_budget = available_cash * 0.50  # Don't consume more than 50% of cash for conversion taxes
+                    max_conversion_by_cash = max_tax_budget / max(0.10, est_tax_rate)
+
+                    conversion_room = min(conversion_room, max_conversion_by_cash)
                     total_converted = 0
 
                     if conversion_room > 0:
@@ -1356,23 +1378,15 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                             pre_tax_ord += total_converted
                             yd["Roth Conversion Amount"] = total_converted
 
-                # Tax Calculations
-                base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, 0, active_mfj, year_offset, infl)
-                state_tax_rate = cur_t if not is_retired else ret_t
+                            # Recalculate taxes after conversion
+                            base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, 0, active_mfj, year_offset,
+                                                                           infl)
+
                 state_tax = pre_tax_ord * (state_tax_rate / 100.0)
-
-                # FICA Tax (Simplified approximation for earned income)
-                fica_tax = 0
-                if earned_income > 0:
-                    ss_wage_base = 168600 * ((1 + infl / 100) ** year_offset)
-                    ss_tax = min(earned_income, ss_wage_base) * 0.062
-                    med_tax = earned_income * 0.0145
-                    addl_med_tax = max(0, earned_income - 250000) * 0.009
-                    fica_tax = ss_tax + med_tax + addl_med_tax
-
                 total_tax = base_fed_tax + state_tax + fica_tax
 
                 # Robust Shortfall / Withdrawal Math
+                portfolio_income = 0
                 cash_outflows = total_exp + asset_contributions + total_tax
                 net_cash_flow = annual_inc - cash_outflows
 
@@ -1391,27 +1405,27 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     for a in sim_assets:
                         if shortfall <= 0: break
                         if a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)', 'Unallocated Cash']:
-                            if a.get('Type') == 'Brokerage (Taxable)':
-                                req_gross = shortfall / 0.85
-                                if a['bal'] >= req_gross:
-                                    a['bal'] -= req_gross
-                                    total_tax += (req_gross - shortfall)
-                                    shortfall = 0
-                                else:
-                                    withdrawn = a['bal']
-                                    a['bal'] = 0
-                                    net_cash = withdrawn * 0.85
-                                    total_tax += (withdrawn - net_cash)
-                                    shortfall -= net_cash
-                            else:
-                                if a['bal'] >= shortfall:
-                                    a['bal'] -= shortfall
-                                    shortfall = 0
-                                else:
-                                    shortfall -= a['bal']
-                                    a['bal'] = 0
+                            eff_tax = 0.05 if a.get('Type') == 'Brokerage (Taxable)' else 0.0
+                            req_gross = shortfall / (1.0 - eff_tax)
 
-                    # Sequence 2: Tax-Deferred (Traditional 401k) - Early Penalties Apply if < 59.5
+                            if a['bal'] >= req_gross:
+                                a['bal'] -= req_gross
+                                tax_inc = req_gross - shortfall
+                                total_tax += tax_inc
+                                portfolio_income += req_gross
+                                yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = req_gross
+                                shortfall = 0
+                            else:
+                                withdrawn = a['bal']
+                                a['bal'] = 0
+                                tax_inc = withdrawn * eff_tax
+                                net_cash = withdrawn - tax_inc
+                                total_tax += tax_inc
+                                portfolio_income += withdrawn
+                                yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = withdrawn
+                                shortfall -= net_cash
+
+                    # Sequence 2: Tax-Deferred (Traditional 401k) - Rule of 55 check
                     if shortfall > 0:
                         for a in sim_assets:
                             if shortfall <= 0: break
@@ -1421,7 +1435,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                 owner_retire_age = ret_age if owner in ['Me', 'Joint'] else (
                                     s_ret_age if has_spouse else 9999)
 
-                                # Rule of 55: Penalty waived if retiring at 55 or later
+                                # Rule of 55: Penalty waived if retiring at 55 or later AND reaching that age
                                 rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
                                 penalty = 0.10 if (owner_age < 59.5 and not rule_of_55) else 0.0
 
@@ -1430,16 +1444,22 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
                                 if a['bal'] >= req_gross:
                                     a['bal'] -= req_gross
-                                    total_tax += (req_gross - shortfall)
+                                    tax_inc = req_gross - shortfall
+                                    total_tax += tax_inc
+                                    portfolio_income += req_gross
+                                    yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = req_gross
                                     shortfall = 0
                                 else:
                                     withdrawn = a['bal']
                                     a['bal'] = 0
-                                    net_cash = withdrawn * (1.0 - eff_tax)
-                                    total_tax += (withdrawn - net_cash)
+                                    tax_inc = withdrawn * eff_tax
+                                    net_cash = withdrawn - tax_inc
+                                    total_tax += tax_inc
+                                    portfolio_income += withdrawn
+                                    yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = withdrawn
                                     shortfall -= net_cash
 
-                    # Sequence 3: Tax-Free (Roth/HSA) - Early Earnings Penalty Proxy if < 59.5
+                    # Sequence 3: Tax-Free (Roth/HSA) - Rule of 55 check
                     if shortfall > 0:
                         for a in sim_assets:
                             if shortfall <= 0: break
@@ -1459,18 +1479,26 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
                                 if a['bal'] >= req_gross:
                                     a['bal'] -= req_gross
-                                    total_tax += (req_gross - shortfall)
+                                    tax_inc = req_gross - shortfall
+                                    total_tax += tax_inc
+                                    portfolio_income += req_gross
+                                    yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = req_gross
                                     shortfall = 0
                                 else:
                                     withdrawn = a['bal']
                                     a['bal'] = 0
-                                    net_cash = withdrawn * (1.0 - eff_tax)
-                                    total_tax += (withdrawn - net_cash)
+                                    tax_inc = withdrawn * eff_tax
+                                    net_cash = withdrawn - tax_inc
+                                    total_tax += tax_inc
+                                    portfolio_income += withdrawn
+                                    yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = withdrawn
                                     shortfall -= net_cash
 
                     # Sequence 4: Complete Liquidity Failure -> Credit Card Debt
                     if shortfall > 0:
                         unfunded_debt_bal += shortfall
+
+                annual_inc += portfolio_income
 
                 # Check for Critical Shortfall Alert
                 if unfunded_debt_bal > 0 and prev_unfunded_debt_bal == 0:
