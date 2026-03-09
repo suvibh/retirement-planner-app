@@ -24,6 +24,22 @@ except ImportError:
 warnings.simplefilter(action='ignore', category=FutureWarning)
 st.set_page_config(page_title="AI Retirement Planner Pro", layout="wide", page_icon="🏦")
 
+# --- GOOGLE ANALYTICS INJECTION ---
+# Replace 'G-XXXXXXXXXX' with your actual Measurement ID
+GA_MEASUREMENT_ID = "G-NWCHZNNPVP"
+ga_script = f"""
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id={GA_MEASUREMENT_ID}"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){{dataLayer.push(arguments);}}
+  gtag('js', new Date());
+
+  gtag('config', '{GA_MEASUREMENT_ID}');
+</script>
+"""
+st.components.v1.html(ga_script, width=0, height=0)
+
 # --- CUSTOM CSS FOR PREMIUM LOOK ---
 st.markdown("""
 <style>
