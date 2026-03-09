@@ -370,7 +370,6 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
               "Start Year": current_year, "End Year": current_year + max(0, 65 - my_age), "Stop at Ret.?": True,
               "Override Growth (%)": None}])
     else:
-        # Migrate old "Age" columns to "Year" columns for backwards compatibility
         if "Start Age" in df_inc.columns:
             df_inc["Start Year"] = current_year + (pd.to_numeric(df_inc["Start Age"], errors='coerce') - my_age)
             df_inc["End Year"] = current_year + (pd.to_numeric(df_inc["End Age"], errors='coerce') - my_age)
@@ -392,7 +391,6 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
             res = call_gemini_json(prompt)
             if res:
                 current_inc = df_inc.to_dict('records')
-                # Primary SS automatically starts at their FRA year defaults (can be adjusted)
                 if 'ss_amount_me' in res:
                     current_inc.append(
                         {"Description": "Estimated Social Security (Primary)", "Category": "Social Security",
@@ -1002,7 +1000,9 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
             sim_re = copy.deepcopy(base_sim_re)
             sim_biz = copy.deepcopy(base_sim_biz)
 
+            unfunded_debt_bal = 0
             sim_res, det_res, nw_det_res = [], [], []
+            milestones_by_year = {}
 
             for year_offset in range(max_years + 1):
                 year = current_year + year_offset
@@ -1022,6 +1022,9 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 nw_yd = {"Year": year, "Age (Primary)": my_current_age}
 
                 annual_inc, annual_ss, pre_tax_ord, pre_tax_cg, earned_income = 0, 0, 0, 0, 0
+
+                # Compound high-interest debt if we enter crisis mode
+                unfunded_debt_bal *= 1.18
 
                 base_mkt_yr = mkt_sequence[year_offset]
                 active_mkt = base_mkt_yr
@@ -1166,7 +1169,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                         yd["Expense: Debt Payments"] = d['pmt']
                     debt_bal_total += d['bal']
 
-                # Milestones
+                # Milestones & 529 Routing
                 for ev in edited_m.to_dict('records'):
                     if ev.get("Description"):
                         desc = str(ev.get("Description", ""))
@@ -1182,36 +1185,61 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
                         freq = ev.get('Frequency', 'One-Time')
                         if freq == 'One-Time':
-                            ey = sy
+                            is_active_milestone = (year == sy)
+                        else:
+                            duration = max(1, ey - sy)
+                            is_active_milestone = (sy <= year < sy + duration) if ey > sy else (year == sy)
 
-                        if sy <= year <= ey and sy != 0:
+                        if is_active_milestone and sy != 0:
                             base_amt = safe_num(ev.get('Amount ($)'))
-                            if freq == 'Monthly':
-                                base_amt *= 12
+                            if freq == 'Monthly': base_amt *= 12
 
                             amt = base_amt * ((1 + infl / 100) ** year_offset)
+
+                            if year not in milestones_by_year: milestones_by_year[year] = []
+                            milestones_by_year[year].append({"desc": desc, "amt": amt})
 
                             if ev.get('Type') == 'Expense':
                                 total_exp += amt
                                 yd[f"Expense: Milestone ({desc})"] = amt
 
-                                # 529 Plan routing logic
+                                # 529 Plan routing logic (Two-Pass Heuristic)
                                 is_education = any(k in desc.lower() for k in
                                                    ['college', 'tuition', 'university', 'education', 'school'])
                                 if is_education:
                                     amount_to_cover = amt
                                     covered_by_529 = 0
+
+                                    # Pass 1: Try to match child name specifically
                                     for a in sim_assets:
                                         if a.get('Type') == '529 Plan' and a['bal'] > 0:
-                                            if a['bal'] >= amount_to_cover:
-                                                a['bal'] -= amount_to_cover
-                                                covered_by_529 += amount_to_cover
-                                                amount_to_cover = 0
-                                                break
-                                            else:
-                                                amount_to_cover -= a['bal']
-                                                covered_by_529 += a['bal']
-                                                a['bal'] = 0
+                                            acct_words = [w.lower() for w in str(a.get('Account Name', '')).split() if
+                                                          len(w) > 2]
+                                            if any(w in desc.lower() for w in acct_words):
+                                                if a['bal'] >= amount_to_cover:
+                                                    a['bal'] -= amount_to_cover
+                                                    covered_by_529 += amount_to_cover
+                                                    amount_to_cover = 0
+                                                    break
+                                                else:
+                                                    amount_to_cover -= a['bal']
+                                                    covered_by_529 += a['bal']
+                                                    a['bal'] = 0
+
+                                    # Pass 2: Fallback to any remaining 529s
+                                    if amount_to_cover > 0:
+                                        for a in sim_assets:
+                                            if a.get('Type') == '529 Plan' and a['bal'] > 0:
+                                                if a['bal'] >= amount_to_cover:
+                                                    a['bal'] -= amount_to_cover
+                                                    covered_by_529 += amount_to_cover
+                                                    amount_to_cover = 0
+                                                    break
+                                                else:
+                                                    amount_to_cover -= a['bal']
+                                                    covered_by_529 += a['bal']
+                                                    a['bal'] = 0
+
                                     if covered_by_529 > 0:
                                         annual_inc += covered_by_529
                                         yd[f"Income: Tax-Free 529 Withdrawal ({desc})"] = covered_by_529
@@ -1220,8 +1248,8 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                 pre_tax_ord += amt
                                 yd[f"Income: Milestone ({desc})"] = amt
 
-                # Asset Waterfall Routing
-                liquid_assets_total, asset_contributions = 0, 0
+                # Asset Contributions
+                asset_contributions = 0
                 if not is_retired:
                     for a in sim_assets:
                         owner = a.get('Owner', 'Me')
@@ -1320,7 +1348,12 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
                 if net_cash_flow > 0:
                     # Surplus
-                    if len(sim_assets) > 0: sim_assets[0]['bal'] += net_cash_flow
+                    if unfunded_debt_bal > 0:
+                        payoff = min(net_cash_flow, unfunded_debt_bal)
+                        unfunded_debt_bal -= payoff
+                        net_cash_flow -= payoff
+                    if net_cash_flow > 0 and len(sim_assets) > 0:
+                        sim_assets[0]['bal'] += net_cash_flow
                 elif net_cash_flow < 0:
                     shortfall = abs(net_cash_flow)
 
@@ -1378,6 +1411,10 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                     shortfall -= a['bal']
                                     a['bal'] = 0
 
+                    # Sequence 4: Complete Liquidity Failure -> Credit Card Debt
+                    if shortfall > 0:
+                        unfunded_debt_bal += shortfall
+
                 liquid_assets_total = 0
                 for a in sim_assets:
                     # Ensure no floating point math drags balance below absolute zero
@@ -1385,7 +1422,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                     liquid_assets_total += a['bal']
                     nw_yd[f"Asset: {a.get('Account Name', 'Account')}"] = a['bal']
 
-                net_worth = liquid_assets_total + re_equity + cur_biz_val - debt_bal_total
+                net_worth = liquid_assets_total + re_equity + cur_biz_val - debt_bal_total - unfunded_debt_bal
 
                 yd["Expense: Taxes"] = total_tax
                 yd["Net Savings"] = annual_inc - total_exp - total_tax
@@ -1393,7 +1430,9 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 nw_yd["Total Liquid Assets"] = liquid_assets_total
                 nw_yd["Total Real Estate Equity"] = re_equity
                 nw_yd["Total Business Equity"] = cur_biz_val
-                nw_yd["Total Debt Liabilities"] = -debt_bal_total
+                nw_yd["Total Debt Liabilities"] = -(debt_bal_total + unfunded_debt_bal)
+                if unfunded_debt_bal > 0:
+                    yd["Expense: Unfunded Shortfall Debt Interest"] = unfunded_debt_bal
                 nw_yd["Total Net Worth"] = net_worth
 
                 sim_res.append(
@@ -1401,35 +1440,39 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                      "Annual Taxes": total_tax, "Annual Net Savings": yd["Net Savings"],
                      "Liquid Assets": liquid_assets_total,
                      "Real Estate Equity": re_equity, "Business Equity": cur_biz_val,
-                     "Debt": -debt_bal_total, "Net Worth": net_worth})
+                     "Debt": -debt_bal_total, "Unfunded Debt": unfunded_debt_bal, "Net Worth": net_worth})
                 det_res.append(yd)
                 nw_det_res.append(nw_yd)
 
-            return sim_res, det_res, nw_det_res
+            return sim_res, det_res, nw_det_res, milestones_by_year
 
 
         # --- EXECUTE BASE DETERMINISTIC RUN ---
         deterministic_seq = [mkt] * (max_years + 1)
-        sim_results, detailed_results, nw_detailed_results = run_simulation(deterministic_seq)
+        sim_results, detailed_results, nw_detailed_results, run_milestones = run_simulation(deterministic_seq)
 
         # --- UI RENDER: DASHBOARD ---
         if len(sim_results) > 0:
             df_sim_nominal = pd.DataFrame(sim_results)
             final_nw = df_sim_nominal.iloc[-1]['Net Worth']
-            deplete_year = df_sim_nominal[df_sim_nominal['Net Worth'] <= 0]['Year'].min()
-            deplete_age = df_sim_nominal[df_sim_nominal['Net Worth'] <= 0]['Age'].min()
+
+            shortfall_mask = df_sim_nominal['Unfunded Debt'] > 0
+            deplete_year = df_sim_nominal[shortfall_mask]['Year'].min() if not df_sim_nominal[
+                shortfall_mask].empty else None
+            deplete_age = df_sim_nominal[shortfall_mask]['Age'].min() if not df_sim_nominal[
+                shortfall_mask].empty else None
 
             c_status, c_ai_btn = st.columns([3, 2])
             with c_status:
-                if final_nw >= 1000000:
+                if deplete_year is not None:
+                    st.error(
+                        f"🔴 **Liquidity Crisis:** You completely exhaust your liquid cash in **Year {deplete_year}** (Age {deplete_age}) and begin accumulating high-interest shortfall debt.")
+                elif final_nw >= 1000000:
                     st.success(
                         f"🟢 **On Track:** Projected Net Worth at timeline end is **${final_nw:,.0f}**. Your assets comfortably outlive your life expectancy.")
                 elif final_nw > 0:
                     st.warning(
                         f"🟡 **Caution:** Projected Net Worth at timeline end is **${final_nw:,.0f}**. You are solvent, but with a narrow margin of safety.")
-                else:
-                    st.error(
-                        f"🔴 **Shortfall Alert:** Assets deplete entirely in Year **{deplete_year}** (Age {deplete_age}).")
 
             with c_ai_btn:
                 st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
@@ -1439,7 +1482,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                             "Current Age": my_age, "Retirement Age": ret_age, "Life Expectancy": my_life_exp_val,
                             "Current Net Worth": df_sim_nominal.iloc[0]['Net Worth'],
                             "Final Net Worth": df_sim_nominal.iloc[-1]['Net Worth'],
-                            "Shortfall Age": str(deplete_age) if not pd.isna(deplete_age) else "None",
+                            "Shortfall Year": str(deplete_year) if deplete_year is not None else "None",
                             "Avg Annual Income": df_sim_nominal['Annual Income'].mean(),
                             "Avg Annual Expenses": df_sim_nominal['Annual Expenses'].mean()
                         }
@@ -1469,7 +1512,8 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 for i in range(len(sim_results)):
                     discount = (1 + infl / 100) ** i
                     for col in ["Annual Income", "Annual Expenses", "Annual Taxes", "Annual Net Savings",
-                                "Liquid Assets", "Real Estate Equity", "Business Equity", "Debt", "Net Worth"]:
+                                "Liquid Assets", "Real Estate Equity", "Business Equity", "Debt", "Unfunded Debt",
+                                "Net Worth"]:
                         sim_results[i][col] /= discount
                     for k in detailed_results[i].keys():
                         if k not in ["Age (Primary)", "Year"]: detailed_results[i][k] /= discount
@@ -1480,6 +1524,20 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
             df_sim = pd.DataFrame(sim_results)
 
             if HAS_PLOTLY:
+                # Pre-calculate Milestone Chart Markers
+                m_years = []
+                m_texts = []
+                m_y_nw = []
+                if run_milestones:
+                    m_years = sorted(list(run_milestones.keys()))
+                    for y in m_years:
+                        discount = (1 + infl / 100) ** (y - current_year) if view_todays_dollars else 1.0
+                        texts = [f"• {m['desc']} (${m['amt'] / discount:,.0f})" for m in run_milestones[y]]
+                        m_texts.append(f"<b>Year {y} Milestones:</b><br>" + "<br>".join(texts))
+
+                        row = df_sim[df_sim['Year'] == y]
+                        m_y_nw.append(row['Net Worth'].values[0] if not row.empty else 0)
+
                 st.write("#### Net Worth Composition (Smart Asset Drawdown)")
                 fig_nw = go.Figure()
                 fig_nw.add_trace(go.Scatter(x=df_sim["Year"], y=df_sim["Liquid Assets"], mode='lines', stackgroup='one',
@@ -1492,12 +1550,19 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 fig_nw.add_trace(
                     go.Scatter(x=df_sim["Year"], y=df_sim["Business Equity"], mode='lines', stackgroup='one',
                                name='Business Equity', fillcolor='rgba(245, 158, 11, 0.5)', line=dict(color='#f59e0b')))
-                fig_nw.add_trace(go.Scatter(x=df_sim["Year"], y=df_sim["Debt"], mode='lines', stackgroup='two',
-                                            name='Debt Liabilities', fillcolor='rgba(244, 63, 94, 0.5)',
-                                            line=dict(color='#f43f5e')))
+                fig_nw.add_trace(go.Scatter(x=df_sim["Year"], y=-df_sim["Unfunded Debt"] - df_sim["Debt"], mode='lines',
+                                            stackgroup='two', name='Total Liabilities (Inc. Shortfalls)',
+                                            fillcolor='rgba(244, 63, 94, 0.5)', line=dict(color='#f43f5e')))
                 fig_nw.add_trace(
                     go.Scatter(x=df_sim["Year"], y=df_sim["Net Worth"], mode='lines', name='Total Net Worth',
                                line=dict(color='#111827', width=3, dash='dot')))
+
+                if m_years:
+                    fig_nw.add_trace(go.Scatter(x=m_years, y=m_y_nw, mode='markers',
+                                                marker=dict(symbol='star', size=14, color='#eab308',
+                                                            line=dict(width=1.5, color='white')), name='Milestones',
+                                                hoverinfo='text', text=m_texts))
+
                 fig_nw.update_layout(hovermode="x unified", yaxis=dict(tickformat="$,.0f"),
                                      margin=dict(l=0, r=0, t=30, b=0),
                                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
@@ -1515,6 +1580,13 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 fig_cf.add_trace(
                     go.Scatter(x=df_sim["Year"], y=df_sim["Annual Net Savings"], mode='lines', name='Net Cashflow',
                                line=dict(color='#10b981', width=3, dash='dot')))
+
+                if m_years:
+                    fig_cf.add_trace(go.Scatter(x=m_years, y=[0] * len(m_years), mode='markers',
+                                                marker=dict(symbol='star', size=14, color='#eab308',
+                                                            line=dict(width=1.5, color='white')), name='Milestones',
+                                                hoverinfo='text', text=m_texts))
+
                 fig_cf.update_layout(hovermode="x unified", yaxis=dict(tickformat="$,.0f"),
                                      margin=dict(l=0, r=0, t=30, b=0),
                                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
@@ -1540,12 +1612,12 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
                     for r in range(mc_runs):
                         rand_seq = [random.gauss(mkt, mc_vol) for _ in range(max_years + 1)]
-                        res, _, _ = run_simulation(rand_seq)
+                        res, _, _, _ = run_simulation(rand_seq)
 
                         nw_path = [step["Net Worth"] for step in res]
                         all_nw_paths.append(nw_path)
 
-                        if nw_path[-1] > 0: success_count += 1
+                        if nw_path[-1] > 0 and min(nw_path) > 0: success_count += 1
 
                     success_rate = (success_count / mc_runs) * 100
 
