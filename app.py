@@ -31,13 +31,66 @@ st.markdown("""
     h1, h2, h3 { color: #1e293b !important; font-family: 'Inter', sans-serif; font-weight: 800 !important; }
     [data-testid="stExpander"] { background-color: white !important; border: 1px solid #e2e8f0 !important; border-radius: 12px !important; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important; margin-bottom: 1rem !important; }
     .stButton > button { border-radius: 8px !important; transition: all 0.2s ease !important; }
-    div[data-testid="column"]:has(button:contains("✨")) button { background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%) !important; color: white !important; border: none !important; font-weight: 600 !important; box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.39) !important; }
-    div[data-testid="column"]:has(button:contains("✨")) button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.39) !important; }
+
     [data-testid="stMetricValue"] { font-size: 1.8rem !important; font-weight: 700 !important; color: #4f46e5 !important; }
     .info-text { font-size: 0.95rem; color: #334155; margin-bottom: 15px; border-left: 4px solid #3b82f6; padding-left: 12px; background-color: #eff6ff; padding-top: 12px; padding-bottom: 12px; padding-right: 10px; border-radius: 0 8px 8px 0; line-height: 1.5;}
 
     [data-testid="stMetricValue"] { font-size: 1.6rem !important; }
     [data-testid="stMetricLabel"] { font-weight: 600 !important; color: #475569 !important; }
+
+    /* Hide marker containers to prevent layout spacing issues */
+    div[data-testid="element-container"]:has(.ai-btn-marker),
+    div[data-testid="element-container"]:has(.save-btn-marker),
+    div[data-testid="element-container"]:has(.main-save-btn-marker) {
+        display: none;
+    }
+
+    /* AI Button subtle styling */
+    div[data-testid="element-container"]:has(.ai-btn-marker) + div[data-testid="element-container"] button {
+        background-color: #f5f3ff !important;
+        border: 1px solid #c7d2fe !important;
+        color: #4f46e5 !important;
+        font-weight: 600 !important;
+        border-radius: 8px !important;
+        transition: all 0.2s ease !important;
+    }
+    div[data-testid="element-container"]:has(.ai-btn-marker) + div[data-testid="element-container"] button:hover {
+        background-color: #e0e7ff !important;
+        border-color: #818cf8 !important;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(79, 70, 229, 0.15) !important;
+    }
+
+    /* Save Button subtle styling */
+    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button {
+        background-color: #f0fdf4 !important;
+        border: 1px solid #bbf7d0 !important;
+        color: #166534 !important;
+        font-weight: 600 !important;
+        border-radius: 8px !important;
+        transition: all 0.2s ease !important;
+    }
+    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button:hover {
+        background-color: #dcfce7 !important;
+        border-color: #86efac !important;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(22, 101, 52, 0.15) !important;
+    }
+
+    /* Main Action Button (Bottom Save) */
+    div[data-testid="element-container"]:has(.main-save-btn-marker) + div[data-testid="element-container"] button {
+        background: linear-gradient(90deg, #10b981 0%, #059669 100%) !important;
+        color: white !important;
+        border: none !important;
+        font-weight: 700 !important;
+        border-radius: 8px !important;
+        box-shadow: 0 4px 14px 0 rgba(16, 185, 129, 0.39) !important;
+        transition: all 0.2s ease !important;
+    }
+    div[data-testid="element-container"]:has(.main-save-btn-marker) + div[data-testid="element-container"] button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px 0 rgba(16, 185, 129, 0.39) !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -294,6 +347,8 @@ with st.expander("👨‍👩‍👧‍👦 1. About You & Your Family", expande
                            key=f"kn_{i}")
         ka = k2.number_input(f"Age {i + 1}", 0, 25, saved_kids[i]['age'] if i < len(saved_kids) else 5, key=f"ka_{i}")
         kids_data.append({"name": kn, "age": ka})
+
+    st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("💾 Save Profile", key="sv_1"):
         save_requested = True
         st.toast("✅ Profile Saved!", icon="💾")
@@ -314,6 +369,7 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
             columns=["Description", "Category", "Owner", "Annual Amount ($)", "Start Age", "End Age", "Stop at Ret.?",
                      "Override Growth (%)"])
 
+    st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("✨ Auto-Estimate My Social Security (AI)"):
         with st.spinner("Asking AI to estimate your Social Security benefits based on your age and income..."):
             curr_inc = sum([safe_num(x.get('Annual Amount ($)', 0)) for x in ud.get('income', [])])
@@ -356,6 +412,8 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
         }, num_rows="dynamic", width="stretch", hide_index=True, key="inc_editor"
     )
     render_total("Total Pre-Tax Income", f"${edited_inc['Annual Amount ($)'].sum():,.0f}")
+
+    st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("💾 Save Income", key="sv_2"):
         save_requested = True
         st.toast("✅ Income Saved!", icon="💾")
@@ -498,6 +556,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
         f"<div style='text-align: center; padding: 15px; margin-top: 15px; background: #eff6ff; border-radius: 8px;'><h3 style='margin:0; color: #1e293b;'>Total Estimated Net Worth: <span style='color: #3b82f6;'>${net_worth:,.0f}</span></h3></div>",
         unsafe_allow_html=True)
 
+    st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("💾 Save Assets & Debts", key="sv_3"):
         save_requested = True
         st.toast("✅ Assets & Debts Saved!", icon="💾")
@@ -513,11 +572,11 @@ curr_inc_total = pd.to_numeric(edited_inc['Annual Amount ($)'], errors='coerce')
 liq_ast_total = pd.to_numeric(edited_ast['Current Balance ($)'], errors='coerce').fillna(0).sum()
 
 if owns_home:
-    h_ctx = f"Primary housing costs are ${h_pmt + h_exp:,.0f}/mo."
-    ai_exclusion = "STRICT RULE: DO NOT INCLUDE Housing, Rent, Mortgages, Auto Loans, or Debt Payments in this list. They are already accounted for."
+    h_ctx = f"Primary housing costs are ${h_pmt + h_exp:,.0f}/mo (Already accounted for)."
+    ai_exclusion = "STRICT RULE: DO NOT INCLUDE Housing, Rent, Mortgages, Auto Loans, or Debt Payments in this list. They are explicitly tracked via balance sheet parameters."
 else:
     h_ctx = "User is currently renting."
-    ai_exclusion = "STRICT RULE: DO NOT INCLUDE Mortgages, Auto Loans, or Debt Payments. HOWEVER, YOU MUST INCLUDE a realistic 'Housing / Rent' expense since they do not own a home."
+    ai_exclusion = "STRICT RULE: DO NOT INCLUDE Mortgages, Auto Loans, or Debt Payments. HOWEVER, YOU MUST INCLUDE a realistic 'Housing / Rent' expense reflecting current local market rates."
 
 f_ctx = f"User({my_age})" + (
     f", Spouse({spouse_name}:{spouse_age})" if has_spouse else "") + f", Dependents({', '.join([f'{k['name']}:{k['age']}' for k in kids_data])})"
@@ -559,6 +618,7 @@ with st.expander("💸 4. Current Budget & Expenses", expanded=False):
                 cur_m_total += amt / 12
     render_total("Total Living Expenses", f"${cur_m_total:,.0f} / mo  |  ${cur_y_total:,.0f} / yr")
 
+    st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("✨ Auto-Estimate My Budget (AI)"):
         with st.spinner("Analyzing cost of living and family needs..."):
             valid = edited_c[edited_c["Description"].astype(str) != ""].copy()
@@ -573,6 +633,8 @@ with st.expander("💸 4. Current Budget & Expenses", expanded=False):
                 st.rerun()
             else:
                 st.error("⚠️ AI returned an invalid format. Please try again.")
+
+    st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("💾 Save Budget", key="sv_4"):
         save_requested = True
         st.toast("✅ Budget Saved!", icon="💾")
@@ -608,6 +670,7 @@ with st.expander("🎉 5. Future Goals & Milestones", expanded=False):
         }, num_rows="dynamic", width="stretch", hide_index=True, key="mil_ed"
     )
 
+    st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("✨ Auto-Forecast Dates & Costs (AI)"):
         with st.spinner("AI is mapping out your timeline and projecting future costs..."):
             valid = edited_m[edited_m["Description"].astype(str) != ""].to_dict('records')
@@ -616,6 +679,8 @@ with st.expander("🎉 5. Future Goals & Milestones", expanded=False):
             if res and isinstance(res, list):
                 st.session_state['one_time_events'] = res
                 st.rerun()
+
+    st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("💾 Save Milestones", key="sv_5"):
         save_requested = True
         st.toast("✅ Milestones Saved!", icon="💾")
@@ -643,6 +708,7 @@ with st.expander("🔮 6. Retirement Assumptions & Budget", expanded=True):
     ret_city = city_autocomplete("Where do you plan to retire?", "retire_city",
                                  default_val=ud.get('retire_city', curr_city))
 
+    st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("✨ Auto-Set Economic Assumptions (AI)"):
         with st.spinner(f"Analyzing historical data and economic forecasts for {ret_city}..."):
             prompt = f"Forecast long-term annual percentages for {ret_city if ret_city else 'the US'}. Return JSON object with keys: 'inflation', 'market_growth', 'income_growth', 'property_growth', 'rent_growth'."
@@ -703,6 +769,7 @@ with st.expander("🔮 6. Retirement Assumptions & Budget", expanded=True):
                 ret_m_total += amt / 12
     render_total("Total Retirement Living Expenses", f"${ret_m_total:,.0f} / mo  |  ${ret_y_total:,.0f} / yr")
 
+    st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("✨ Simulate My Retirement Budget (AI)"):
         with st.spinner(f"Modelling specific living costs for {ret_city}..."):
             valid = edited_r[edited_r["Description"].astype(str) != ""].copy()
@@ -717,6 +784,8 @@ with st.expander("🔮 6. Retirement Assumptions & Budget", expanded=True):
                 st.rerun()
             else:
                 st.error("⚠️ AI returned an invalid format. Please try again.")
+
+    st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("💾 Save Assumptions", key="sv_6"):
         save_requested = True
         st.toast("✅ Assumptions Saved!", icon="💾")
@@ -750,6 +819,7 @@ with st.expander("⚖️ 7. Advanced Scenarios & Taxes", expanded=False):
                                 value=float(st.session_state['assumptions'].get('retire_tax_rate', 0.0)),
                                 help="Are you moving to a tax-free state in retirement? Change this to 0.")
 
+        st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
         if st.button("✨ Auto-Estimate State Tax (AI)"):
             with st.spinner("Looking up local state tax rates..."):
                 prompt = f"User in {curr_city}. Total Pre-Tax Income: ${curr_inc_total:,.0f}. Suggest the effective STATE AND LOCAL tax rate ONLY (do not include Federal Tax). Return JSON: {{'current_tax_rate': float, 'retire_tax_rate': float}}"
@@ -769,6 +839,7 @@ with st.expander("⚖️ 7. Advanced Scenarios & Taxes", expanded=False):
                                    index=roth_target_idx,
                                    help="The AI will convert just enough Traditional funds each year to reach the very top of this tax bracket, but no higher.")
 
+    st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
     if st.button("💾 Save Settings", key="sv_7"):
         save_requested = True
         st.session_state['assumptions']['roth_conversions'] = roth_conversions
@@ -912,7 +983,8 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                 is_my_alive = age <= my_life_exp_val
                 is_spouse_alive = has_spouse and (s_age <= spouse_life_exp_val)
 
-                if not is_my_alive and not is_spouse_alive: break
+                if not is_my_alive and not is_spouse_alive:
+                    break
 
                 is_retired = age >= ret_age
                 is_spouse_retired = has_spouse and s_age >= s_ret_age
@@ -951,6 +1023,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
 
                     start_age = safe_num(inc.get('Start Age'), 18)
                     end_age = safe_num(inc.get('End Age'), 100)
+
                     if cat_name == "Social Security": stop_at_ret = False
 
                     is_active = False
@@ -962,7 +1035,9 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                     if inc.get("Description") and is_active:
                         g = safe_num(inc.get('Override Growth (%)'), inc_g)
                         base_amt = safe_num(inc.get('Annual Amount ($)'))
-                        if cat_name == "Social Security" and owner == "Me": base_amt = base_amt * my_ss_multi
+
+                        if cat_name == "Social Security" and owner == "Me":
+                            base_amt = base_amt * my_ss_multi
 
                         amt = base_amt * ((1 + g / 100) ** year_offset)
                         annual_inc += amt
@@ -1014,7 +1089,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                         yd["Expense: RE Mortgage"] = r['pmt']
                     re_equity += (r['val'] - r['debt'])
 
-                # Expenses
+                # Core Expenses & Toggles
                 total_exp = re_exp_total
                 active_expense_dict = ret_exp_by_cat if is_retired else curr_exp_by_cat
                 for cat, base_amt in active_expense_dict.items():
@@ -1022,7 +1097,10 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                         infl_ed if cat == "Education" else infl)
                     inflated_exp = base_amt * ((1 + cat_infl / 100) ** year_offset)
 
+                    # Drop expenses significantly if widow(er)
                     if has_spouse and not (is_my_alive and is_spouse_alive): inflated_exp *= 0.6
+
+                    # Health Insurance Logic
                     if medicare_gap and is_retired and age < 65 and cat == "Healthcare": inflated_exp += (
                                 15000 * ((1 + infl_hc / 100) ** year_offset))
                     if medicare_cliff and cat == "Healthcare" and age >= 65: inflated_exp *= 0.50
@@ -1064,8 +1142,8 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                                 pre_tax_ord += amt
                                 yd[f"Income: Milestone ({ev.get('Description')})"] = amt
 
-                # Asset Contributions
-                asset_contributions = 0
+                # Asset Waterfall Routing
+                liquid_assets_total, asset_contributions = 0, 0
                 if not is_retired:
                     for a in sim_assets:
                         owner = a.get('Owner', 'Me')
@@ -1144,11 +1222,12 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                             pre_tax_ord += total_converted
                             yd["Roth Conversion Amount"] = total_converted
 
-                # Taxes
+                # Tax Calculations
                 base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, 0, active_mfj, year_offset, infl)
                 state_tax_rate = cur_t if not is_retired else ret_t
                 state_tax = pre_tax_ord * (state_tax_rate / 100.0)
 
+                # FICA Tax (Simplified approximation for earned income)
                 fica_tax = 0
                 if earned_income > 0:
                     ss_wage_base = 168600 * ((1 + infl / 100) ** year_offset)
@@ -1159,14 +1238,17 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
 
                 total_tax = base_fed_tax + state_tax + fica_tax
 
-                # Withdrawals & Shortfall Logic
+                # Robust Shortfall / Withdrawal Math
                 cash_outflows = total_exp + asset_contributions + total_tax
                 net_cash_flow = annual_inc - cash_outflows
 
                 if net_cash_flow > 0:
+                    # Surplus
                     if len(sim_assets) > 0: sim_assets[0]['bal'] += net_cash_flow
                 elif net_cash_flow < 0:
                     shortfall = abs(net_cash_flow)
+
+                    # Sequence 1: Taxable Brokerage / Cash
                     for a in sim_assets:
                         if shortfall <= 0: break
                         if a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)', 'Unallocated Cash']:
@@ -1190,6 +1272,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                                     shortfall -= a['bal']
                                     a['bal'] = 0
 
+                    # Sequence 2: Tax-Deferred (Traditional 401k)
                     if shortfall > 0:
                         for a in sim_assets:
                             if shortfall <= 0: break
@@ -1207,6 +1290,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                                     total_tax += (withdrawn - net_cash)
                                     shortfall -= net_cash
 
+                    # Sequence 3: Tax-Free (Roth/HSA)
                     if shortfall > 0:
                         for a in sim_assets:
                             if shortfall <= 0: break
@@ -1220,6 +1304,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
 
                 liquid_assets_total = 0
                 for a in sim_assets:
+                    # Ensure no floating point math drags balance below absolute zero
                     a['bal'] = max(0, a['bal'])
                     liquid_assets_total += a['bal']
                     nw_yd[f"Asset: {a.get('Account Name', 'Account')}"] = a['bal']
@@ -1268,6 +1353,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                     st.error(f"🔴 **Shortfall Alert:** Assets deplete entirely at Age **{deplete_age}**.")
 
             with c_ai_btn:
+                st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
                 if st.button("✨ Generate AI Financial Health Report", use_container_width=True):
                     with st.spinner("AI acting as fiduciary advisor..."):
                         sim_summary = {
@@ -1366,6 +1452,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                                           help="Historically, the S&P 500 maintains a volatility (standard deviation) proximal to 15%. Fixed income allocations approximate 5%.")
             mc_runs = col_mc2.number_input("Number of Simulations", min_value=10, max_value=500, value=100, step=10)
 
+            col_mc3.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
             if col_mc3.button("✨ Run Monte Carlo Simulation", use_container_width=True):
                 with st.spinner(f"Rendering {mc_runs} parallel market sequences..."):
                     success_count = 0
@@ -1446,6 +1533,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
 
 # --- FINAL SAVE CORE ---
 st.markdown("---")
+st.markdown('<div class="main-save-btn-marker"></div>', unsafe_allow_html=True)
 if st.button("🚀 Save Full Profile to Cloud Server", type="primary", use_container_width=True,
              key="save_main") or save_requested:
     if st.session_state['user_email'] == "guest_demo":
