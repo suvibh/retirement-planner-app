@@ -493,7 +493,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
     st.divider()
     st.subheader("Liquid Savings & Investments")
     st.markdown(
-        '<div class="info-text">💡 <strong>Smart Withdrawals & Early Penalties:</strong> If you need cash in retirement, the system pulls from regular taxable accounts first. Once you reach the <strong>eligible age of 59.5</strong> (or 55 if you retire at that age), it will pull from traditional 401(k)s, and saves your tax-free Roth accounts for last.</div>',
+        '<div class="info-text">💡 <strong>Employer Match Note:</strong> If you receive an employer 401(k) match, professionally this is part of your total compensation. To model this correctly, list it in the <strong>Income</strong> table above and then mirror it here as an <strong>Annual Addition</strong>. This ensures the engine correctly grows your balance without reducing your spendable monthly cash.<br><br><strong>Withdrawal Priority:</strong> The system always drains 1) Cash/Savings, then 2) Brokerage assets. Only after those are gone will it tap Traditional 401(k)s (applying Rule of 55 penalties if under age 55).</div>',
         unsafe_allow_html=True)
     df_ast = pd.DataFrame(ud.get('liquid_assets', []))
     if df_ast.empty:
@@ -519,7 +519,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
             "Current Balance ($)": st.column_config.NumberColumn("Current Balance ($)", step=5000, format="$%d"),
             "Annual Contribution ($/yr)": st.column_config.NumberColumn("Annual Additions ($/yr)", step=1000,
                                                                         format="$%d",
-                                                                        help="How much you save into this account every year."),
+                                                                        help="Include both your contributions and any employer matches here."),
             "Est. Annual Growth (%)": st.column_config.NumberColumn("Expected Return (%)", format="%.1f%%"),
             "Stop Contrib at Ret.?": st.column_config.CheckboxColumn("Stop Adding at Ret.?",
                                                                      help="Check this if you will stop saving into this account once the owner retires.")
@@ -1234,8 +1234,10 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                             acct_name_clean = re.sub(r'[^a-zA-Z0-9\s]', '',
                                                                      str(a.get('Account Name', ''))).lower()
                                             desc_clean = re.sub(r'[^a-zA-Z0-9\s]', '', desc).lower()
-                                            acct_words = [w for w in acct_name_clean.split() if
-                                                          len(w) > 3 and w not in ['plan', 'account', '529']]
+
+                                            # Strip possessives like 's from the account name words for fuzzy matching
+                                            acct_words = [re.sub(r's$', '', w) for w in acct_name_clean.split() if
+                                                          len(w) > 3 and w not in ['plan', 'account', '529', 'savings']]
 
                                             match = False
                                             for w in acct_words:
