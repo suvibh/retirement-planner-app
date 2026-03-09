@@ -31,7 +31,8 @@ st.markdown("""
     h1, h2, h3 { color: #1e293b !important; font-family: 'Inter', sans-serif; font-weight: 800 !important; }
     [data-testid="stExpander"] { background-color: white !important; border: 1px solid #e2e8f0 !important; border-radius: 12px !important; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important; margin-bottom: 1rem !important; }
     .stButton > button { border-radius: 8px !important; transition: all 0.2s ease !important; }
-
+    div[data-testid="column"]:has(button:contains("✨")) button { background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%) !important; color: white !important; border: none !important; font-weight: 600 !important; box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.39) !important; }
+    div[data-testid="column"]:has(button:contains("✨")) button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.39) !important; }
     [data-testid="stMetricValue"] { font-size: 1.8rem !important; font-weight: 700 !important; color: #4f46e5 !important; }
     .info-text { font-size: 0.95rem; color: #334155; margin-bottom: 15px; border-left: 4px solid #3b82f6; padding-left: 12px; background-color: #eff6ff; padding-top: 12px; padding-bottom: 12px; padding-right: 10px; border-radius: 0 8px 8px 0; line-height: 1.5;}
 
@@ -237,6 +238,7 @@ if 'onboarding_shown' not in st.session_state:
     st.toast("Welcome! Hover over the (?) icons if you ever need help understanding the math.", icon="👋")
     st.session_state['onboarding_shown'] = True
 
+current_year = datetime.date.today().year
 ud = st.session_state.get('user_data', {})
 p_info = ud.get('personal_info', {})
 if 'current_expenses' not in st.session_state: st.session_state['current_expenses'] = ud.get('current_expenses', [])
@@ -307,7 +309,7 @@ save_requested = False
 # --- 1. PERSONAL INFO ---
 with st.expander("👨‍👩‍👧‍👦 1. About You & Your Family", expanded=True):
     st.markdown(
-        '<div class="info-text">💡 <strong>Why we ask this:</strong> Your exact age helps us accurately calculate IRS rules like when you <em>must</em> start taking money out of retirement accounts (RMDs). Adding a spouse lets us use the bigger "Married Filing Jointly" tax deduction, and listing kids helps the AI predict when childcare ends and college starts.</div>',
+        '<div class="info-text">💡 <strong>Why we ask this:</strong> Your exact birth year helps us accurately calculate IRS rules like when you <em>must</em> start taking money out of retirement accounts (RMDs). Adding a spouse lets us use the bigger "Married Filing Jointly" tax deduction, and listing kids helps the AI predict when childcare ends and college starts.</div>',
         unsafe_allow_html=True)
 
     c1, c2 = st.columns(2)
@@ -319,13 +321,14 @@ with st.expander("👨‍👩‍👧‍👦 1. About You & Your Family", expande
     my_dob = c2.date_input("Your Date of Birth", value=default_dob, min_value=datetime.date(1920, 1, 1),
                            max_value=datetime.date.today())
     my_age = relativedelta(datetime.date.today(), my_dob).years
+    my_birth_year = my_dob.year
 
     curr_city = city_autocomplete("Where do you live? (City)", "curr_city", default_val=p_info.get('current_city', ''))
 
     st.divider()
     has_spouse = st.checkbox("Include a Spouse or Partner? (Enables joint tax brackets)",
                              value=p_info.get('has_spouse', False))
-    spouse_name, spouse_dob, spouse_age = "", None, 0
+    spouse_name, spouse_dob, spouse_age, spouse_birth_year = "", None, 0, current_year
     if has_spouse:
         sc1, sc2 = st.columns(2)
         spouse_name = sc1.text_input("Spouse/Partner Name", value=p_info.get('spouse_name', ''))
@@ -335,6 +338,7 @@ with st.expander("👨‍👩‍👧‍👦 1. About You & Your Family", expande
         spouse_dob = sc2.date_input("Spouse Date of Birth", value=s_default_dob, min_value=datetime.date(1920, 1, 1),
                                     max_value=datetime.date.today())
         spouse_age = relativedelta(datetime.date.today(), spouse_dob).years
+        spouse_birth_year = spouse_dob.year
 
     st.divider()
     saved_kids = p_info.get('kids', [])
@@ -356,17 +360,25 @@ with st.expander("👨‍👩‍👧‍👦 1. About You & Your Family", expande
 # --- 2. INCOME ---
 with st.expander("💵 2. Your Income Streams", expanded=False):
     st.markdown(
-        '<div class="info-text">💡 <strong>How we handle your money:</strong> We automatically separate your regular paycheck (like W-2s) from investment income because the IRS taxes them differently.<br><br><strong>Social Security:</strong> Use the AI button below, or type in what you expect to get at your "Full Retirement Age" (usually 67). Our math engine will automatically adjust that number up or down depending on the exact age you decide to retire!</div>',
+        '<div class="info-text">💡 <strong>How we handle your money:</strong> We automatically separate your regular paycheck (like W-2s) from investment income because the IRS taxes them differently.<br><br><strong>Social Security:</strong> Use the AI button below, or type in what you expect to get at your "Full Retirement Age" (usually 67). Our math engine will automatically adjust that number up or down depending on the exact year you decide to retire!</div>',
         unsafe_allow_html=True)
+
     df_inc = pd.DataFrame(ud.get('income', []))
     if df_inc.empty:
         df_inc = pd.DataFrame(
             [{"Description": "Base Salary", "Category": "Base Salary (W-2)", "Owner": "Me", "Annual Amount ($)": 0,
-              "Start Age": my_age, "End Age": 65, "Stop at Ret.?": True, "Override Growth (%)": None}])
+              "Start Year": current_year, "End Year": current_year + max(0, 65 - my_age), "Stop at Ret.?": True,
+              "Override Growth (%)": None}])
     else:
+        # Migrate old "Age" columns to "Year" columns for backwards compatibility
+        if "Start Age" in df_inc.columns:
+            df_inc["Start Year"] = current_year + (pd.to_numeric(df_inc["Start Age"], errors='coerce') - my_age)
+            df_inc["End Year"] = current_year + (pd.to_numeric(df_inc["End Age"], errors='coerce') - my_age)
+            df_inc = df_inc.drop(columns=["Start Age", "End Age"])
+
         if "Stop at Ret.?" not in df_inc.columns: df_inc["Stop at Ret.?"] = False
         df_inc = df_inc.reindex(
-            columns=["Description", "Category", "Owner", "Annual Amount ($)", "Start Age", "End Age", "Stop at Ret.?",
+            columns=["Description", "Category", "Owner", "Annual Amount ($)", "Start Year", "End Year", "Stop at Ret.?",
                      "Override Growth (%)"])
 
     st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
@@ -380,16 +392,18 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
             res = call_gemini_json(prompt)
             if res:
                 current_inc = df_inc.to_dict('records')
+                # Primary SS automatically starts at their FRA year defaults (can be adjusted)
                 if 'ss_amount_me' in res:
                     current_inc.append(
-                        {"Description": "Estimated Social Security (Me)", "Category": "Social Security", "Owner": "Me",
-                         "Annual Amount ($)": res['ss_amount_me'], "Start Age": 67, "End Age": 100,
-                         "Stop at Ret.?": False, "Override Growth (%)": None})
+                        {"Description": "Estimated Social Security (Primary)", "Category": "Social Security",
+                         "Owner": "Me", "Annual Amount ($)": res['ss_amount_me'], "Start Year": my_birth_year + 67,
+                         "End Year": 2100, "Stop at Ret.?": False, "Override Growth (%)": None})
                 if 'ss_amount_spouse' in res and has_spouse:
                     current_inc.append(
                         {"Description": "Estimated Social Security (Spouse)", "Category": "Social Security",
-                         "Owner": "Spouse", "Annual Amount ($)": res['ss_amount_spouse'], "Start Age": 67,
-                         "End Age": 100, "Stop at Ret.?": False, "Override Growth (%)": None})
+                         "Owner": "Spouse", "Annual Amount ($)": res['ss_amount_spouse'],
+                         "Start Year": spouse_birth_year + 67, "End Year": 2100, "Stop at Ret.?": False,
+                         "Override Growth (%)": None})
                 st.session_state['user_data']['income'] = current_inc
                 st.rerun()
 
@@ -404,10 +418,10 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
                                                                               "Other"]),
             "Owner": st.column_config.SelectboxColumn("Whose Income?", options=["Me", "Spouse", "Joint"]),
             "Annual Amount ($)": st.column_config.NumberColumn("Amount per Year ($)", step=1000, format="$%d"),
-            "Start Age": st.column_config.NumberColumn("Start Age", min_value=18, max_value=100),
-            "End Age": st.column_config.NumberColumn("End Age", min_value=18, max_value=100),
+            "Start Year": st.column_config.NumberColumn("Start Year", min_value=1900, max_value=2100, format="%d"),
+            "End Year": st.column_config.NumberColumn("End Year", min_value=1900, max_value=2100, format="%d"),
             "Stop at Ret.?": st.column_config.CheckboxColumn("Stop at Retirement?",
-                                                             help="If checked, this income will automatically turn off when the owner reaches their chosen retirement age."),
+                                                             help="If checked, this income will automatically turn off when the specific owner reaches their chosen retirement year."),
             "Override Growth (%)": st.column_config.NumberColumn("Custom Growth (%)", step=0.1, format="%.1f%%")
         }, num_rows="dynamic", width="stretch", hide_index=True, key="inc_editor"
     )
@@ -510,7 +524,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
                                                                         help="How much you save into this account every year."),
             "Est. Annual Growth (%)": st.column_config.NumberColumn("Expected Return (%)", format="%.1f%%"),
             "Stop Contrib at Ret.?": st.column_config.CheckboxColumn("Stop Adding at Ret.?",
-                                                                     help="Check this if you will stop saving into this account once you retire.")
+                                                                     help="Check this if you will stop saving into this account once the owner retires.")
         }, num_rows="dynamic", width="stretch", hide_index=True, key="assets_editor"
     )
 
@@ -891,18 +905,22 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
 
 
         # --- SOCIAL SECURITY FRA MATH ---
-        my_ss_fra = 67 if my_dob.year >= 1960 else (
-            66 + (min(my_dob.year - 1954, 10) / 12.0) if my_dob.year >= 1955 else 66)
-        my_ss_multi = 1.0
-        if ret_age < my_ss_fra:
-            months_early = (my_ss_fra - ret_age) * 12
-            if months_early <= 36:
-                my_ss_multi = 1.0 - (months_early * (5 / 9 * 0.01))
-            else:
-                my_ss_multi = 1.0 - (36 * (5 / 9 * 0.01)) - ((months_early - 36) * (5 / 12 * 0.01))
-        elif ret_age > my_ss_fra:
-            months_late = min((ret_age - my_ss_fra) * 12, 36)
-            my_ss_multi = 1.0 + (months_late * (2 / 3 * 0.01))
+        def get_ss_multi(birth_year, retire_age):
+            fra = 67 if birth_year >= 1960 else (66 + (min(birth_year - 1954, 10) / 12.0) if birth_year >= 1955 else 66)
+            if retire_age < fra:
+                months_early = (fra - retire_age) * 12
+                if months_early <= 36:
+                    return 1.0 - (months_early * (5 / 9 * 0.01))
+                else:
+                    return 1.0 - (36 * (5 / 9 * 0.01)) - ((months_early - 36) * (5 / 12 * 0.01))
+            elif retire_age > fra:
+                months_late = min((retire_age - fra) * 12, 36)
+                return 1.0 + (months_late * (2 / 3 * 0.01))
+            return 1.0
+
+
+        my_ss_multi = get_ss_multi(my_birth_year, ret_age)
+        spouse_ss_multi = get_ss_multi(spouse_birth_year, s_ret_age) if has_spouse else 1.0
 
         irs_uniform_table = {73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1, 80: 20.2, 81: 19.4,
                              82: 18.5, 83: 17.7, 84: 16.8, 85: 16.0, 86: 15.2, 87: 14.4, 88: 13.7, 89: 12.9, 90: 12.2,
@@ -962,8 +980,18 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
         current_year = datetime.date.today().year
         my_life_exp_val = my_life_exp if my_life_exp else 95
         spouse_life_exp_val = spouse_life_exp if has_spouse and spouse_life_exp else 0
-        max_years = max(0, my_life_exp_val - my_age)
-        if has_spouse: max_years = max(max_years, spouse_life_exp_val - spouse_age)
+
+        primary_retire_year = my_birth_year + ret_age
+        spouse_retire_year = spouse_birth_year + s_ret_age if has_spouse else 9999
+
+        primary_end_year = my_birth_year + my_life_exp_val
+        spouse_end_year = spouse_birth_year + spouse_life_exp_val if has_spouse else current_year
+
+        max_year = max(primary_end_year, spouse_end_year)
+        max_years = max_year - current_year
+
+        primary_rmd_age = 73 if my_birth_year <= 1959 else 75
+        spouse_rmd_age = 73 if spouse_birth_year <= 1959 else 75
 
 
         # --- CORE SIMULATION ENGINE ---
@@ -977,29 +1005,29 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
 
             for year_offset in range(max_years + 1):
                 year = current_year + year_offset
-                age = my_age + year_offset
-                s_age = spouse_age + year_offset if has_spouse else 0
+                my_current_age = year - my_birth_year
+                spouse_current_age = year - spouse_birth_year if has_spouse else 0
 
-                is_my_alive = age <= my_life_exp_val
-                is_spouse_alive = has_spouse and (s_age <= spouse_life_exp_val)
+                is_my_alive = year <= primary_end_year
+                is_spouse_alive = has_spouse and (year <= spouse_end_year)
 
                 if not is_my_alive and not is_spouse_alive:
                     break
 
-                is_retired = age >= ret_age
-                is_spouse_retired = has_spouse and s_age >= s_ret_age
+                is_retired = year >= primary_retire_year
+                is_spouse_retired = has_spouse and (year >= spouse_retire_year)
 
-                yd = {"Age": age, "Year": year}
-                nw_yd = {"Age": age, "Year": year}
+                yd = {"Year": year, "Age (Primary)": my_current_age}
+                nw_yd = {"Year": year, "Age (Primary)": my_current_age}
 
                 annual_inc, annual_ss, pre_tax_ord, pre_tax_cg, earned_income = 0, 0, 0, 0, 0
 
                 base_mkt_yr = mkt_sequence[year_offset]
                 active_mkt = base_mkt_yr
                 if glidepath and is_retired:
-                    years_retired = age - ret_age
+                    years_retired = year - primary_retire_year
                     active_mkt = max(3.0, base_mkt_yr - (math.floor(years_retired / 5) * 1.0))
-                if stress_test and is_retired and age < (int(ret_age) + 3): active_mkt = -20.0
+                if stress_test and (primary_retire_year <= year < primary_retire_year + 3): active_mkt = -20.0
 
                 active_mfj = True if has_spouse and is_my_alive and is_spouse_alive else False
 
@@ -1013,31 +1041,32 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                     cat_name = inc.get("Category", "Other")
                     stop_at_ret = inc.get("Stop at Ret.?", False)
 
-                    owner_retired = False
-                    if owner == "Me":
-                        owner_retired = is_retired
-                    elif owner == "Spouse":
-                        owner_retired = is_spouse_retired if has_spouse else True
+                    owner_retire_year = primary_retire_year
+                    if owner == "Spouse":
+                        owner_retire_year = spouse_retire_year
                     elif owner == "Joint":
-                        owner_retired = is_retired
+                        owner_retire_year = primary_retire_year
 
-                    start_age = safe_num(inc.get('Start Age'), 18)
-                    end_age = safe_num(inc.get('End Age'), 100)
+                    start_year = safe_num(inc.get('Start Year'), current_year)
+                    end_year = safe_num(inc.get('End Year'), 2100)
 
                     if cat_name == "Social Security": stop_at_ret = False
 
                     is_active = False
                     if stop_at_ret:
-                        is_active = (age >= start_age) and not owner_retired
+                        is_active = (year >= start_year) and (year < owner_retire_year)
                     else:
-                        is_active = (start_age <= age <= end_age)
+                        is_active = (start_year <= year <= end_year)
 
                     if inc.get("Description") and is_active:
                         g = safe_num(inc.get('Override Growth (%)'), inc_g)
                         base_amt = safe_num(inc.get('Annual Amount ($)'))
 
-                        if cat_name == "Social Security" and owner == "Me":
-                            base_amt = base_amt * my_ss_multi
+                        if cat_name == "Social Security":
+                            if owner == "Me":
+                                base_amt = base_amt * my_ss_multi
+                            elif owner == "Spouse":
+                                base_amt = base_amt * spouse_ss_multi
 
                         amt = base_amt * ((1 + g / 100) ** year_offset)
                         annual_inc += amt
@@ -1047,17 +1076,22 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                         if cat_name in ["Base Salary (W-2)", "Bonus / Commission",
                                         "Contractor (1099)"]: earned_income += amt
 
-                # RMDs
+                # RMDs (Calculated individually)
                 rmd_income = 0
-                rmd_target_age = 73 if my_dob.year <= 1959 else 75
-                if age >= rmd_target_age and is_my_alive:
-                    factor = irs_uniform_table.get(age, 2.0)
-                    for a in sim_assets:
-                        if a.get('Type') == 'Traditional 401k/IRA' and a['bal'] > 0:
+                for a in sim_assets:
+                    if a.get('Type') == 'Traditional 401k/IRA' and a['bal'] > 0:
+                        owner = a.get('Owner', 'Me')
+                        owner_age = my_current_age if owner == 'Me' or owner == 'Joint' else spouse_current_age
+                        owner_alive = is_my_alive if owner == 'Me' or owner == 'Joint' else is_spouse_alive
+                        owner_rmd_age = primary_rmd_age if owner == 'Me' or owner == 'Joint' else spouse_rmd_age
+
+                        if owner_alive and owner_age >= owner_rmd_age:
+                            factor = irs_uniform_table.get(owner_age, 2.0)
                             rmd_amt = a['bal'] / factor
                             a['bal'] -= rmd_amt
                             rmd_income += rmd_amt
                             pre_tax_ord += rmd_amt
+
                 if rmd_income > 0:
                     annual_inc += rmd_income
                     yd["Income: RMDs"] = rmd_income
@@ -1101,15 +1135,15 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                     if has_spouse and not (is_my_alive and is_spouse_alive): inflated_exp *= 0.6
 
                     # Health Insurance Logic
-                    if medicare_gap and is_retired and age < 65 and cat == "Healthcare": inflated_exp += (
+                    if medicare_gap and is_retired and my_current_age < 65 and cat == "Healthcare": inflated_exp += (
                                 15000 * ((1 + infl_hc / 100) ** year_offset))
-                    if medicare_cliff and cat == "Healthcare" and age >= 65: inflated_exp *= 0.50
+                    if medicare_cliff and cat == "Healthcare" and my_current_age >= 65: inflated_exp *= 0.50
 
                     total_exp += inflated_exp
                     yd[f"Expense: {cat}"] = inflated_exp
 
                 # LTC Shock
-                if ltc_shock and age >= (my_life_exp_val - 2) and is_my_alive:
+                if ltc_shock and my_current_age >= (my_life_exp_val - 2) and is_my_alive:
                     ltc_cost = 100000 * ((1 + infl_hc / 100) ** year_offset)
                     total_exp += ltc_cost
                     yd["Expense: Long Term Care Shock"] = ltc_cost
@@ -1144,30 +1178,27 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
 
                 # Asset Waterfall Routing
                 liquid_assets_total, asset_contributions = 0, 0
-                if not is_retired:
-                    for a in sim_assets:
-                        owner = a.get('Owner', 'Me')
-                        owner_retired = False
-                        if owner == 'Me':
-                            owner_retired = is_retired
-                        elif owner == 'Spouse':
-                            owner_retired = is_spouse_retired if has_spouse else True
-                        elif owner == 'Joint':
-                            owner_retired = is_retired
+                for a in sim_assets:
+                    owner = a.get('Owner', 'Me')
+                    owner_retire_year = primary_retire_year
+                    if owner == 'Spouse':
+                        owner_retire_year = spouse_retire_year
+                    elif owner == 'Joint':
+                        owner_retire_year = primary_retire_year
 
-                        is_owner_alive = False
-                        if owner == 'Me':
-                            is_owner_alive = is_my_alive
-                        elif owner == 'Spouse':
-                            is_owner_alive = is_spouse_alive
-                        else:
-                            is_owner_alive = is_my_alive or is_spouse_alive
+                    is_owner_alive = False
+                    if owner == 'Me':
+                        is_owner_alive = is_my_alive
+                    elif owner == 'Spouse':
+                        is_owner_alive = is_spouse_alive
+                    else:
+                        is_owner_alive = is_my_alive or is_spouse_alive
 
-                        if is_owner_alive:
-                            stop_contrib = a.get('stop_at_ret', True)
-                            if not (stop_contrib and owner_retired):
-                                a['bal'] += a['contrib']
-                                asset_contributions += a['contrib']
+                    if is_owner_alive:
+                        stop_contrib = a.get('stop_at_ret', True)
+                        if not (stop_contrib and year >= owner_retire_year):
+                            a['bal'] += a['contrib']
+                            asset_contributions += a['contrib']
 
                 # Pre-apply market growth
                 for a in sim_assets:
@@ -1320,11 +1351,12 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                 nw_yd["Total Debt Liabilities"] = -debt_bal_total
                 nw_yd["Total Net Worth"] = net_worth
 
-                sim_res.append({"Age": age, "Year": year, "Annual Income": annual_inc, "Annual Expenses": total_exp,
-                                "Annual Taxes": total_tax, "Annual Net Savings": yd["Net Savings"],
-                                "Liquid Assets": liquid_assets_total,
-                                "Real Estate Equity": re_equity, "Business Equity": cur_biz_val,
-                                "Debt": -debt_bal_total, "Net Worth": net_worth})
+                sim_res.append(
+                    {"Year": year, "Age": my_current_age, "Annual Income": annual_inc, "Annual Expenses": total_exp,
+                     "Annual Taxes": total_tax, "Annual Net Savings": yd["Net Savings"],
+                     "Liquid Assets": liquid_assets_total,
+                     "Real Estate Equity": re_equity, "Business Equity": cur_biz_val,
+                     "Debt": -debt_bal_total, "Net Worth": net_worth})
                 det_res.append(yd)
                 nw_det_res.append(nw_yd)
 
@@ -1339,6 +1371,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
         if len(sim_results) > 0:
             df_sim_nominal = pd.DataFrame(sim_results)
             final_nw = df_sim_nominal.iloc[-1]['Net Worth']
+            deplete_year = df_sim_nominal[df_sim_nominal['Net Worth'] <= 0]['Year'].min()
             deplete_age = df_sim_nominal[df_sim_nominal['Net Worth'] <= 0]['Age'].min()
 
             c_status, c_ai_btn = st.columns([3, 2])
@@ -1350,17 +1383,18 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                     st.warning(
                         f"🟡 **Caution:** Projected Net Worth at timeline end is **${final_nw:,.0f}**. You are solvent, but with a narrow margin of safety.")
                 else:
-                    st.error(f"🔴 **Shortfall Alert:** Assets deplete entirely at Age **{deplete_age}**.")
+                    st.error(
+                        f"🔴 **Shortfall Alert:** Assets deplete entirely in Year **{deplete_year}** (Age {deplete_age}).")
 
             with c_ai_btn:
                 st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
                 if st.button("✨ Generate AI Financial Health Report", use_container_width=True):
                     with st.spinner("AI acting as fiduciary advisor..."):
                         sim_summary = {
-                            "Current Age": my_age, "Retirement Age": ret_age, "Life Expectancy": my_life_exp_val,
+                            "Current Year": current_year, "Retirement Year": primary_retire_year,
                             "Current Net Worth": df_sim_nominal.iloc[0]['Net Worth'],
                             "Final Net Worth": df_sim_nominal.iloc[-1]['Net Worth'],
-                            "Shortfall Age": str(deplete_age) if not pd.isna(deplete_age) else "None",
+                            "Shortfall Year": str(deplete_year) if not pd.isna(deplete_year) else "None",
                             "Avg Annual Income": df_sim_nominal['Annual Income'].mean(),
                             "Avg Annual Expenses": df_sim_nominal['Annual Expenses'].mean()
                         }
@@ -1403,21 +1437,21 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
             if HAS_PLOTLY:
                 st.write("#### Net Worth Composition (Smart Asset Drawdown)")
                 fig_nw = go.Figure()
-                fig_nw.add_trace(go.Scatter(x=df_sim["Age"], y=df_sim["Liquid Assets"], mode='lines', stackgroup='one',
+                fig_nw.add_trace(go.Scatter(x=df_sim["Year"], y=df_sim["Liquid Assets"], mode='lines', stackgroup='one',
                                             name='Liquid Assets', fillcolor='rgba(20, 184, 166, 0.5)',
                                             line=dict(color='#14b8a6')))
                 fig_nw.add_trace(
-                    go.Scatter(x=df_sim["Age"], y=df_sim["Real Estate Equity"], mode='lines', stackgroup='one',
+                    go.Scatter(x=df_sim["Year"], y=df_sim["Real Estate Equity"], mode='lines', stackgroup='one',
                                name='Real Estate Equity', fillcolor='rgba(139, 92, 246, 0.5)',
                                line=dict(color='#8b5cf6')))
                 fig_nw.add_trace(
-                    go.Scatter(x=df_sim["Age"], y=df_sim["Business Equity"], mode='lines', stackgroup='one',
+                    go.Scatter(x=df_sim["Year"], y=df_sim["Business Equity"], mode='lines', stackgroup='one',
                                name='Business Equity', fillcolor='rgba(245, 158, 11, 0.5)', line=dict(color='#f59e0b')))
-                fig_nw.add_trace(go.Scatter(x=df_sim["Age"], y=df_sim["Debt"], mode='lines', stackgroup='two',
+                fig_nw.add_trace(go.Scatter(x=df_sim["Year"], y=df_sim["Debt"], mode='lines', stackgroup='two',
                                             name='Debt Liabilities', fillcolor='rgba(244, 63, 94, 0.5)',
                                             line=dict(color='#f43f5e')))
                 fig_nw.add_trace(
-                    go.Scatter(x=df_sim["Age"], y=df_sim["Net Worth"], mode='lines', name='Total Net Worth',
+                    go.Scatter(x=df_sim["Year"], y=df_sim["Net Worth"], mode='lines', name='Total Net Worth',
                                line=dict(color='#111827', width=3, dash='dot')))
                 fig_nw.update_layout(hovermode="x unified", yaxis=dict(tickformat="$,.0f"),
                                      margin=dict(l=0, r=0, t=30, b=0),
@@ -1426,14 +1460,15 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
 
                 st.write("#### Annual Cash Flow & Progressive Taxes")
                 fig_cf = go.Figure()
-                fig_cf.add_trace(go.Scatter(x=df_sim["Age"], y=df_sim["Annual Income"], mode='lines', name='Income',
+                fig_cf.add_trace(go.Scatter(x=df_sim["Year"], y=df_sim["Annual Income"], mode='lines', name='Income',
                                             line=dict(color='#4f46e5', width=3)))
-                fig_cf.add_trace(go.Scatter(x=df_sim["Age"], y=df_sim["Annual Expenses"], mode='lines', name='Expenses',
-                                            line=dict(color='#f43f5e', width=3)))
-                fig_cf.add_trace(go.Scatter(x=df_sim["Age"], y=df_sim["Annual Taxes"], mode='lines', name='Taxes',
+                fig_cf.add_trace(
+                    go.Scatter(x=df_sim["Year"], y=df_sim["Annual Expenses"], mode='lines', name='Expenses',
+                               line=dict(color='#f43f5e', width=3)))
+                fig_cf.add_trace(go.Scatter(x=df_sim["Year"], y=df_sim["Annual Taxes"], mode='lines', name='Taxes',
                                             line=dict(color='#f59e0b', width=3)))
                 fig_cf.add_trace(
-                    go.Scatter(x=df_sim["Age"], y=df_sim["Annual Net Savings"], mode='lines', name='Net Cashflow',
+                    go.Scatter(x=df_sim["Year"], y=df_sim["Annual Net Savings"], mode='lines', name='Net Cashflow',
                                line=dict(color='#10b981', width=3, dash='dot')))
                 fig_cf.update_layout(hovermode="x unified", yaxis=dict(tickformat="$,.0f"),
                                      margin=dict(l=0, r=0, t=30, b=0),
@@ -1470,7 +1505,7 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                     success_rate = (success_count / mc_runs) * 100
 
                     path_len = len(all_nw_paths[0])
-                    ages = [df_sim.iloc[i]["Age"] for i in range(path_len)]
+                    years_list = [df_sim.iloc[i]["Year"] for i in range(path_len)]
                     p10, p50, p90 = [], [], []
 
                     for i in range(path_len):
@@ -1487,13 +1522,13 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                     if HAS_PLOTLY:
                         fig_mc = go.Figure()
                         fig_mc.add_trace(
-                            go.Scatter(x=ages, y=p90, mode='lines', name='90th Percentile (Favorable Timeline)',
+                            go.Scatter(x=years_list, y=p90, mode='lines', name='90th Percentile (Favorable Timeline)',
                                        line=dict(color='#10b981', dash='dot')))
                         fig_mc.add_trace(
-                            go.Scatter(x=ages, y=p50, mode='lines', name='50th Percentile (Median Expectation)',
+                            go.Scatter(x=years_list, y=p50, mode='lines', name='50th Percentile (Median Expectation)',
                                        line=dict(color='#3b82f6', width=3)))
                         fig_mc.add_trace(
-                            go.Scatter(x=ages, y=p10, mode='lines', name='10th Percentile (Severe Contraction)',
+                            go.Scatter(x=years_list, y=p10, mode='lines', name='10th Percentile (Severe Contraction)',
                                        line=dict(color='#f43f5e', dash='dot')))
                         fig_mc.update_layout(title="Stochastic Net Worth Projections", hovermode="x unified",
                                              yaxis=dict(tickformat="$,.0f"), margin=dict(l=0, r=0, t=40, b=0),
@@ -1513,10 +1548,10 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                 df_det = pd.DataFrame(detailed_results).fillna(0)
                 inc_c = sorted([c for c in df_det.columns if c.startswith("Income:") or c.startswith("Roth")])
                 exp_c = sorted([c for c in df_det.columns if c.startswith("Expense:")])
-                ord_det = ["Age", "Year"] + inc_c + exp_c + ["Net Savings"]
-                st.dataframe(df_det[ord_det].set_index("Age").style.format(
-                    {c: "${:,.0f}" for c in ord_det if c not in ["Age", "Year"]} | {"Year": "{:.0f}"}),
-                             use_container_width=True)
+                ord_det = ["Year", "Age (Primary)"] + inc_c + exp_c + ["Net Savings"]
+                st.dataframe(df_det[ord_det].set_index("Year").style.format(
+                    {c: "${:,.0f}" for c in ord_det if c not in ["Age (Primary)", "Year"]} | {
+                        "Age (Primary)": "{:.0f}"}), use_container_width=True)
 
             with t2:
                 st.subheader("Detailed Net Worth Log")
@@ -1524,12 +1559,12 @@ with st.expander("📈 8. Your Financial Dashboard", expanded=True):
                     "Track the exact, year-by-year balance of every single asset account and liability to trace your drawdowns and growth.")
                 df_nw = pd.DataFrame(nw_detailed_results).fillna(0)
                 ast_c = sorted([c for c in df_nw.columns if c.startswith("Asset:")])
-                ord_nw = ["Age", "Year"] + ast_c + ["Total Liquid Assets", "Total Real Estate Equity",
-                                                    "Total Business Equity", "Total Debt Liabilities",
-                                                    "Total Net Worth"]
-                st.dataframe(df_nw[ord_nw].set_index("Age").style.format(
-                    {c: "${:,.0f}" for c in ord_nw if c not in ["Age", "Year"]} | {"Year": "{:.0f}"}),
-                             use_container_width=True)
+                ord_nw = ["Year", "Age (Primary)"] + ast_c + ["Total Liquid Assets", "Total Real Estate Equity",
+                                                              "Total Business Equity", "Total Debt Liabilities",
+                                                              "Total Net Worth"]
+                st.dataframe(df_nw[ord_nw].set_index("Year").style.format(
+                    {c: "${:,.0f}" for c in ord_nw if c not in ["Age (Primary)", "Year"]} | {
+                        "Age (Primary)": "{:.0f}"}), use_container_width=True)
 
 # --- FINAL SAVE CORE ---
 st.markdown("---")
