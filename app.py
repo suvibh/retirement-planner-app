@@ -360,7 +360,7 @@ with st.expander("👨‍👩‍👧‍👦 1. About You & Your Family", expande
 # --- 2. INCOME ---
 with st.expander("💵 2. Your Income Streams", expanded=False):
     st.markdown(
-        '<div class="info-text">💡 <strong>How we handle your money:</strong> We automatically separate your regular paycheck (like W-2s) from investment income because the IRS taxes them differently.<br><br><strong>Social Security:</strong> Use the AI button below, or type in what you expect to get at your "Full Retirement Age" (usually 67). Our math engine will automatically adjust that number up or down depending on the exact year you decide to retire!</div>',
+        '<div class="info-text">💡 <strong>Employer Match Note:</strong> Employer 401(k) matches are considered part of your total compensation, but are <strong>not</strong> spendable cash income. Professionally, you should list the match here for visibility and then "mirror" it as an <strong>Annual Addition</strong> in your Assets table below to correctly grow your balance without inflating your monthly grocery budget.</div>',
         unsafe_allow_html=True)
 
     df_inc = pd.DataFrame(ud.get('income', []))
@@ -391,6 +391,7 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
             res = call_gemini_json(prompt)
             if res:
                 current_inc = df_inc.to_dict('records')
+                # Primary SS automatically starts at their FRA year defaults (can be adjusted)
                 if 'ss_amount_me' in res:
                     current_inc.append(
                         {"Description": "Estimated Social Security (Primary)", "Category": "Social Security",
@@ -493,7 +494,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
     st.divider()
     st.subheader("Liquid Savings & Investments")
     st.markdown(
-        '<div class="info-text">💡 <strong>Employer Match Note:</strong> If you receive an employer 401(k) match, professionally this is part of your total compensation. To model this correctly, list it in the <strong>Income</strong> table above and then mirror it here as an <strong>Annual Addition</strong>. This ensures the engine correctly grows your balance without reducing your spendable monthly cash.<br><br><strong>Withdrawal Priority:</strong> The system always drains 1) Cash/Savings, then 2) Brokerage assets. Only after those are gone will it tap Traditional 401(k)s (applying Rule of 55 penalties if under age 55).</div>',
+        '<div class="info-text">💡 <strong>Withdrawal Priority:</strong> The system always drains 1) Cash/Savings, then 2) Brokerage assets. Only after those are gone will it tap Traditional 401(k)s (applying Rule of 55 penalties if under age 55).</div>',
         unsafe_allow_html=True)
     df_ast = pd.DataFrame(ud.get('liquid_assets', []))
     if df_ast.empty:
@@ -1091,8 +1092,12 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                 base_amt = base_amt * spouse_ss_multi
 
                         amt = base_amt * ((1 + g / 100) ** year_offset)
-                        annual_inc += amt
+
+                        # LOGGING: Track Match in Audit, but only add to spendable cash if NOT a match
                         yd[f"Income: {cat_name}"] = yd.get(f"Income: {cat_name}", 0) + amt
+                        if cat_name != "Employer Match (401k/HSA)":
+                            annual_inc += amt
+
                         if cat_name == "Social Security": annual_ss += amt
                         if cat_name not in ["Employer Match (401k/HSA)", "Social Security"]: pre_tax_ord += amt
                         if cat_name in ["Base Salary (W-2)", "Bonus / Commission",
@@ -1103,9 +1108,9 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 for a in sim_assets:
                     if a.get('Type') == 'Traditional 401k/IRA' and a['bal'] > 0:
                         owner = a.get('Owner', 'Me')
-                        owner_age = my_current_age if owner == 'Me' or owner == 'Joint' else spouse_current_age
-                        owner_alive = is_my_alive if owner == 'Me' or owner == 'Joint' else is_spouse_alive
-                        owner_rmd_age = primary_rmd_age if owner == 'Me' or owner == 'Joint' else spouse_rmd_age
+                        owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
+                        owner_alive = is_my_alive if owner in ['Me', 'Joint'] else is_spouse_alive
+                        owner_rmd_age = primary_rmd_age if owner in ['Me', 'Joint'] else spouse_rmd_age
 
                         if owner_alive and owner_age >= owner_rmd_age:
                             factor = irs_uniform_table.get(owner_age, 2.0)
@@ -1221,28 +1226,28 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                 total_exp += amt
                                 yd[f"Expense: Milestone ({desc})"] = amt
 
-                                # 529 Plan routing logic (Two-Pass Heuristic)
+                                # 529 Plan routing logic (Improved Two-Pass Fuzzy Matching)
                                 is_education = any(k in desc.lower() for k in
                                                    ['college', 'tuition', 'university', 'education', 'school'])
                                 if is_education:
                                     amount_to_cover = amt
                                     covered_by_529 = 0
 
-                                    # Pass 1: Try to match child name specifically
+                                    # Pass 1: Try to match child name specifically (Strips possessive 's)
                                     for a in sim_assets:
                                         if a.get('Type') == '529 Plan' and a['bal'] > 0:
                                             acct_name_clean = re.sub(r'[^a-zA-Z0-9\s]', '',
                                                                      str(a.get('Account Name', ''))).lower()
                                             desc_clean = re.sub(r'[^a-zA-Z0-9\s]', '', desc).lower()
 
-                                            # Strip possessives like 's from the account name words for fuzzy matching
+                                            # Strip trailing 's' and generic words to isolate names
                                             acct_words = [re.sub(r's$', '', w) for w in acct_name_clean.split() if
-                                                          len(w) > 3 and w not in ['plan', 'account', '529', 'savings']]
+                                                          len(w) > 2 and w not in ['plan', 'account', '529', 'savings']]
 
                                             match = False
                                             for w in acct_words:
                                                 if w in desc_clean:
-                                                    match = True
+                                                    match = True;
                                                     break
 
                                             if match:
@@ -1341,7 +1346,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                          a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)',
                                                            'Unallocated Cash'])
                     est_tax_rate = marginal_rate + (state_tax_rate / 100.0)
-                    max_tax_budget = available_cash * 0.50  # Don't consume more than 50% of cash for conversion taxes
+                    max_tax_budget = available_cash * 0.50
                     max_conversion_by_cash = max_tax_budget / max(0.10, est_tax_rate)
 
                     conversion_room = min(conversion_room, max_conversion_by_cash)
@@ -1378,7 +1383,6 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                         if total_converted > 0:
                             pre_tax_ord += total_converted
                             yd["Roth Conversion Amount"] = total_converted
-
                             # Recalculate taxes after conversion
                             base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, 0, active_mfj, year_offset,
                                                                            infl)
@@ -1513,7 +1517,7 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                                     yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = withdrawn
                                     shortfall -= net_cash
 
-                    # Sequence 4: Complete Liquidity Failure -> Credit Card Debt
+                    # Sequence 4: Complete Liquidity Failure -> Shortfall Debt
                     if shortfall > 0:
                         unfunded_debt_bal += shortfall
 
@@ -1528,7 +1532,6 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
 
                 liquid_assets_total = 0
                 for a in sim_assets:
-                    # Ensure no floating point math drags balance below absolute zero
                     a['bal'] = max(0, a['bal'])
                     liquid_assets_total += a['bal']
                     nw_yd[f"Asset: {a.get('Account Name', 'Account')}"] = a['bal']
