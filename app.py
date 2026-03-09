@@ -46,8 +46,7 @@ st.markdown("""
     h1, h2, h3 { color: #1e293b !important; font-family: 'Inter', sans-serif; font-weight: 800 !important; }
     [data-testid="stExpander"] { background-color: white !important; border: 1px solid #e2e8f0 !important; border-radius: 12px !important; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important; margin-bottom: 1rem !important; }
     .stButton > button { border-radius: 8px !important; transition: all 0.2s ease !important; }
-    div[data-testid="column"]:has(button:contains("✨")) button { background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%) !important; color: white !important; border: none !important; font-weight: 600 !important; box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.39) !important; }
-    div[data-testid="column"]:has(button:contains("✨")) button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.39) !important; }
+
     [data-testid="stMetricValue"] { font-size: 1.8rem !important; font-weight: 700 !important; color: #4f46e5 !important; }
     .info-text { font-size: 0.95rem; color: #334155; margin-bottom: 15px; border-left: 4px solid #3b82f6; padding-left: 12px; background-color: #eff6ff; padding: 10px; padding-bottom: 12px; padding-right: 10px; border-radius: 0 8px 8px 0; line-height: 1.5;}
 
@@ -428,6 +427,7 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
                 res = call_gemini_json(prompt)
                 if res:
                     current_inc = df_inc.to_dict('records')
+                    # Primary SS automatically starts at their FRA year defaults (can be adjusted)
                     if 'ss_amount_me' in res:
                         current_inc.append(
                             {"Description": "Estimated Social Security (Primary)", "Category": "Social Security",
@@ -796,64 +796,94 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
     spouse_life_exp = cc4.slider("Spouse Life Expectancy", 70, 115,
                                  int(p_info.get('spouse_life_exp', 95))) if has_spouse else None
 
-    st.divider()
-    st.markdown("#### 📊 Macroeconomic & Tax Assumptions")
-    st.markdown(
-        '<div class="info-text">💡 <strong>AI Estimation:</strong> Click the ✨ next to any field to have the AI estimate a realistic, localized value based on historical data and your profile!</div>',
-        unsafe_allow_html=True)
+    # --- ASSUMPTIONS BLOCK ---
+    with st.container():
+        st.markdown("""
+        <style>
+        .assumption-card {
+            background-color: white;
+            border: 1px solid #e2e8f0;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
+        }
+        </style>
+        <div class="assumption-card">
+        """, unsafe_allow_html=True)
+
+        st.markdown("#### 📊 Macroeconomic & Tax Assumptions")
+        st.markdown(
+            '<div class="info-text">💡 <strong>AI Estimation:</strong> Click the ✨ AI button next to any field to have the AI estimate a realistic, localized value based on historical data and your profile!</div>',
+            unsafe_allow_html=True)
 
 
-    def ai_number_input(label, state_key, default_val, prompt, col):
-        with col:
-            sub_c1, sub_c2 = st.columns([4, 1])
-            val = sub_c1.number_input(label, value=float(st.session_state['assumptions'].get(state_key, default_val)),
-                                      step=0.1, key=f"in_{state_key}")
+        def ai_number_input(label, state_key, default_val, prompt, col):
+            with col:
+                sub_c1, sub_c2 = st.columns([5, 2])
 
-            # CSS trick to align the button with the input field
-            sub_c2.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            sub_c2.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
-            if sub_c2.button("✨", key=f"btn_{state_key}", help=f"AI Estimate for {label}", use_container_width=True):
-                with st.spinner(f"AI estimating {label}..."):
-                    res = call_gemini_json(prompt)
-                    if res and state_key in res:
-                        st.session_state['assumptions'][state_key] = float(res[state_key])
-                        st.rerun()
-            st.session_state['assumptions'][state_key] = val
-            return val
+                widget_key = f"in_{state_key}"
+                if widget_key not in st.session_state:
+                    st.session_state[widget_key] = float(st.session_state['assumptions'].get(state_key, default_val))
+
+                val = sub_c1.number_input(label, step=0.1, key=widget_key)
+
+                # CSS trick to align the button with the input field label
+                sub_c2.markdown("<div style='height: 27px;'></div>", unsafe_allow_html=True)
+                sub_c2.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
+                if sub_c2.button("✨ AI", key=f"btn_{state_key}", help=f"AI Estimate for {label}",
+                                 use_container_width=True):
+                    with st.spinner(f"AI estimating {label}..."):
+                        res = call_gemini_json(prompt)
+                        if res and state_key in res:
+                            new_val = float(res[state_key])
+                            st.session_state['assumptions'][state_key] = new_val
+                            st.session_state[widget_key] = new_val
+                            st.rerun()
+
+                st.session_state['assumptions'][state_key] = val
+                return val
 
 
-    ac1, ac2, ac3 = st.columns(3)
-    mkt = ai_number_input("Market Growth (%)", 'market_growth', 7.5,
-                          f"What is a realistic conservative long-term annual market growth rate for a diversified retirement portfolio? Return JSON: {{'market_growth': float}}",
-                          ac1)
-    infl = ai_number_input("General CPI Inflation (%)", 'inflation', 2.5,
-                           f"What is the projected long-term average general US CPI inflation rate? Return JSON: {{'inflation': float}}",
-                           ac2)
-    inc_g = ai_number_input("Income Growth (%)", 'income_growth', 3.2,
-                            f"What is a realistic annual salary growth/merit increase rate? Return JSON: {{'income_growth': float}}",
-                            ac3)
+        ac1, ac2, ac3 = st.columns(3)
+        mkt = ai_number_input("Market Growth (%)", 'market_growth', 7.5,
+                              f"What is a realistic conservative long-term annual market growth rate for a diversified retirement portfolio? Return JSON: {{'market_growth': float}}",
+                              ac1)
+        infl = ai_number_input("General CPI Inflation (%)", 'inflation', 2.5,
+                               f"What is the projected long-term average general US CPI inflation rate? Return JSON: {{'inflation': float}}",
+                               ac2)
+        inc_g = ai_number_input("Income Growth (%)", 'income_growth', 3.2,
+                                f"What is a realistic annual salary growth/merit increase rate? Return JSON: {{'income_growth': float}}",
+                                ac3)
 
-    ac4, ac5, ac6 = st.columns(3)
-    infl_hc = ai_number_input("Healthcare Inflation (%)", 'inflation_healthcare', 5.5,
-                              f"What is the projected long-term annual healthcare cost inflation rate in the US? Return JSON: {{'inflation_healthcare': float}}",
-                              ac4)
-    infl_ed = ai_number_input("Education Inflation (%)", 'inflation_education', 4.5,
-                              f"What is the projected long-term annual college tuition inflation rate in the US? Return JSON: {{'inflation_education': float}}",
-                              ac5)
-    prop_g = ai_number_input("Property Growth (%)", 'property_growth', 2.5,
-                             f"Historical average annual real estate appreciation rate for {curr_city}? Return JSON: {{'property_growth': float}}",
-                             ac6)
+        ac4, ac5, ac6 = st.columns(3)
+        infl_hc = ai_number_input("Healthcare Inflation (%)", 'inflation_healthcare', 5.5,
+                                  f"What is the projected long-term annual healthcare cost inflation rate in the US? Return JSON: {{'inflation_healthcare': float}}",
+                                  ac4)
+        infl_ed = ai_number_input("Education Inflation (%)", 'inflation_education', 4.5,
+                                  f"What is the projected long-term annual college tuition inflation rate in the US? Return JSON: {{'inflation_education': float}}",
+                                  ac5)
+        prop_g = ai_number_input("Property Growth (%)", 'property_growth', 2.5,
+                                 f"Historical average annual real estate appreciation rate for {curr_city}? Return JSON: {{'property_growth': float}}",
+                                 ac6)
 
-    ac7, ac8, ac9 = st.columns(3)
-    rent_g = ai_number_input("Rent Growth (%)", 'rent_growth', 3.0,
-                             f"Projected average annual rent increase rate for {curr_city}? Return JSON: {{'rent_growth': float}}",
-                             ac7)
-    cur_t = ai_number_input("Current State Tax (%)", 'current_tax_rate', 5.0,
-                            f"User lives in {curr_city} with ${curr_inc_total:,.0f} income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'current_tax_rate': float}}",
-                            ac8)
-    ret_t = ai_number_input("Retire State Tax (%)", 'retire_tax_rate', 0.0,
-                            f"User plans to retire in {ret_city_state} with estimated retirement income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'retire_tax_rate': float}}",
-                            ac9)
+        ac7, ac8, ac9 = st.columns(3)
+        rent_g = ai_number_input("Rent Growth (%)", 'rent_growth', 3.0,
+                                 f"Projected average annual rent increase rate for {curr_city}? Return JSON: {{'rent_growth': float}}",
+                                 ac7)
+        cur_t = ai_number_input("Current State Tax (%)", 'current_tax_rate', 5.0,
+                                f"User lives in {curr_city} with ${curr_inc_total:,.0f} income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'current_tax_rate': float}}",
+                                ac8)
+        ret_t = ai_number_input("Retire State Tax (%)", 'retire_tax_rate', 0.0,
+                                f"User plans to retire in {ret_city_state} with estimated retirement income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'retire_tax_rate': float}}",
+                                ac9)
+
+        st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
+        if st.button("💾 Save Assumptions", key="sv_assumptions", use_container_width=True):
+            save_requested = True
+            st.toast("✅ Assumptions Saved!", icon="💾")
+
+        st.markdown("</div>", unsafe_allow_html=True)
 
     with st.expander("⚙️ Advanced Scenarios & Tax Optimization", expanded=False):
         st.markdown(
@@ -892,7 +922,7 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
                                        help="The AI will convert just enough Traditional funds each year to reach the very top of this selected tax bracket.")
 
         st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("💾 Save Settings", key="sv_7"):
+        if st.button("💾 Save Advanced Settings", key="sv_7"):
             save_requested = True
             st.session_state['assumptions']['roth_conversions'] = roth_conversions
             st.session_state['assumptions']['roth_target'] = roth_target
@@ -1992,7 +2022,7 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
             mc_runs = col_mc2.number_input("Number of Simulations", min_value=10, max_value=500, value=100, step=10)
 
             with col_mc3:
-                st.markdown('<div class="ai-btn-marker" style="height: 28px;"></div>', unsafe_allow_html=True)
+                st.markdown('<div class="ai-btn-marker" style="height: 27px;"></div>', unsafe_allow_html=True)
                 if st.button("✨ Run Monte Carlo Simulation", use_container_width=True):
                     with st.spinner(f"Rendering {mc_runs} parallel market sequences..."):
                         success_count = 0
