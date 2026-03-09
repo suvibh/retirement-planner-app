@@ -391,7 +391,6 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
             res = call_gemini_json(prompt)
             if res:
                 current_inc = df_inc.to_dict('records')
-                # Primary SS automatically starts at their FRA year defaults (can be adjusted)
                 if 'ss_amount_me' in res:
                     current_inc.append(
                         {"Description": "Estimated Social Security (Primary)", "Category": "Social Security",
@@ -494,7 +493,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
     st.divider()
     st.subheader("Liquid Savings & Investments")
     st.markdown(
-        '<div class="info-text">💡 <strong>Smart Withdrawals & Early Penalties:</strong> If you need cash in retirement, the system pulls from regular taxable brokerages first. If you have a cash shortfall <em>before</em> age 59.5, the engine will tap your 401(k)/IRA but will automatically calculate and charge you the IRS 10% early withdrawal penalty <strong>(unless you retire at age 55 or older, activating the penalty-free Rule of 55)</strong>.</div>',
+        '<div class="info-text">💡 <strong>Smart Withdrawals & Early Penalties:</strong> If you need cash in retirement, the system pulls from regular taxable accounts first. Once you reach the <strong>eligible age of 59.5</strong> (or 55 if you retire at that age), it will pull from traditional 401(k)s, and saves your tax-free Roth accounts for last.</div>',
         unsafe_allow_html=True)
     df_ast = pd.DataFrame(ud.get('liquid_assets', []))
     if df_ast.empty:
@@ -599,7 +598,7 @@ budget_categories = ["Housing / Rent", "Transportation", "Food", "Utilities", "I
 # --- 4. CURRENT EXPENSES ---
 with st.expander("💸 4. Current Budget & Expenses", expanded=False):
     st.markdown(
-        '<div class="info-text">💡 <strong>Double-Counting Guard:</strong> The simulation automatically ignores "Housing" (if you own) and "Debt Payments" listed below, as it pulls the exact costs from your Real Estate and Liabilities sections above!</div>',
+        '<div class="info-text">💡 <strong>AI Budget Builder:</strong> Our AI looks at your city, family size, and income to build a realistic, localized budget. It even adjusts for the fact that higher earners might spend more on travel or cars, but assumes you are still a smart saver.<br><br><strong>Double-Counting Guard:</strong> We automatically ignore "Housing" (if you own) and "Debt Payments" listed below, as it pulls the exact costs from your Assets & Debts section!</div>',
         unsafe_allow_html=True)
     df_c = pd.DataFrame(st.session_state['current_expenses'])
     if df_c.empty:
@@ -1401,29 +1400,47 @@ with st.expander("📈 8. Advanced Simulation & Analytics Dashboard", expanded=T
                 elif net_cash_flow < 0:
                     shortfall = abs(net_cash_flow)
 
-                    # Sequence 1: Taxable Brokerage / Cash
+                    # Sequence 1a: Checking/Savings/HYSA (0% Tax)
                     for a in sim_assets:
                         if shortfall <= 0: break
-                        if a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)', 'Unallocated Cash']:
-                            eff_tax = 0.05 if a.get('Type') == 'Brokerage (Taxable)' else 0.0
-                            req_gross = shortfall / (1.0 - eff_tax)
-
-                            if a['bal'] >= req_gross:
-                                a['bal'] -= req_gross
-                                tax_inc = req_gross - shortfall
-                                total_tax += tax_inc
-                                portfolio_income += req_gross
-                                yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = req_gross
+                        if a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash']:
+                            if a['bal'] >= shortfall:
+                                withdrawn = shortfall
+                                a['bal'] -= shortfall
+                                portfolio_income += withdrawn
+                                yd[f"Income: Withdrawal ({a.get('Account Name', 'Cash')})"] = withdrawn
                                 shortfall = 0
                             else:
                                 withdrawn = a['bal']
-                                a['bal'] = 0
-                                tax_inc = withdrawn * eff_tax
-                                net_cash = withdrawn - tax_inc
-                                total_tax += tax_inc
                                 portfolio_income += withdrawn
-                                yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = withdrawn
-                                shortfall -= net_cash
+                                yd[f"Income: Withdrawal ({a.get('Account Name', 'Cash')})"] = withdrawn
+                                shortfall -= a['bal']
+                                a['bal'] = 0
+
+                    # Sequence 1b: Taxable Brokerage (5% Tax on Gains Proxy)
+                    if shortfall > 0:
+                        for a in sim_assets:
+                            if shortfall <= 0: break
+                            if a.get('Type') == 'Brokerage (Taxable)':
+                                eff_tax = 0.05
+                                req_gross = shortfall / (1.0 - eff_tax)
+
+                                if a['bal'] >= req_gross:
+                                    a['bal'] -= req_gross
+                                    tax_inc = req_gross - shortfall
+                                    total_tax += tax_inc
+                                    portfolio_income += req_gross
+                                    yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = req_gross
+                                    shortfall = 0
+                                else:
+                                    withdrawn = a['bal']
+                                    a['bal'] = 0
+                                    tax_inc = withdrawn * eff_tax
+                                    net_cash = withdrawn - tax_inc
+                                    total_tax += tax_inc
+                                    portfolio_income += withdrawn
+                                    yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = withdrawn
+                                    shortfall -= net_cash
 
                     # Sequence 2: Tax-Deferred (Traditional 401k) - Rule of 55 check
                     if shortfall > 0:
