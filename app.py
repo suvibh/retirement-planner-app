@@ -25,17 +25,19 @@ warnings.simplefilter(action='ignore', category=FutureWarning)
 st.set_page_config(page_title="AI Retirement Planner Pro", layout="wide", page_icon="🏦")
 
 # --- GOOGLE ANALYTICS INJECTION ---
-ga_script = f"""
-<!-- Google tag (gtag.js) -->
-<script async src="https://www.googletagmanager.com/gtag/js?id={GA_MEASUREMENT_ID}"></script>
-<script>
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){{dataLayer.push(arguments);}}
-  gtag('js', new Date());
-  gtag('config', '{GA_MEASUREMENT_ID}');
-</script>
-"""
-st.components.v1.html(ga_script, width=0, height=0)
+GA_MEASUREMENT_ID = st.secrets.get("GA_MEASUREMENT_ID", "")
+if GA_MEASUREMENT_ID:
+    ga_script = f"""
+    <!-- Google tag (gtag.js) -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id={GA_MEASUREMENT_ID}"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){{dataLayer.push(arguments);}}
+      gtag('js', new Date());
+      gtag('config', '{GA_MEASUREMENT_ID}');
+    </script>
+    """
+    st.components.v1.html(ga_script, width=0, height=0)
 
 # --- CUSTOM CSS FOR PREMIUM LOOK ---
 st.markdown("""
@@ -44,7 +46,8 @@ st.markdown("""
     h1, h2, h3 { color: #1e293b !important; font-family: 'Inter', sans-serif; font-weight: 800 !important; }
     [data-testid="stExpander"] { background-color: white !important; border: 1px solid #e2e8f0 !important; border-radius: 12px !important; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05) !important; margin-bottom: 1rem !important; }
     .stButton > button { border-radius: 8px !important; transition: all 0.2s ease !important; }
-
+    div[data-testid="column"]:has(button:contains("✨")) button { background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%) !important; color: white !important; border: none !important; font-weight: 600 !important; box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.39) !important; }
+    div[data-testid="column"]:has(button:contains("✨")) button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.39) !important; }
     [data-testid="stMetricValue"] { font-size: 1.8rem !important; font-weight: 700 !important; color: #4f46e5 !important; }
     .info-text { font-size: 0.95rem; color: #334155; margin-bottom: 15px; border-left: 4px solid #3b82f6; padding-left: 12px; background-color: #eff6ff; padding: 10px; padding-bottom: 12px; padding-right: 10px; border-radius: 0 8px 8px 0; line-height: 1.5;}
 
