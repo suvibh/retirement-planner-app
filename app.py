@@ -249,7 +249,7 @@ if 'user_email' not in st.session_state:
                 st.warning("Password must be at least 6 characters long.")
 
     st.divider()
-    if st.button("🚀 Try the Demo (Guest Mode)", use_container_width=True):
+    if st.button("🚀 Try the Demo (Guest Mode)", width="stretch"):
         st.session_state['user_email'] = "guest_demo"
         st.session_state['user_data'] = {}
         st.rerun()
@@ -318,7 +318,7 @@ with c_logout:
     st.markdown(
         f"<div style='text-align: right; font-size: 0.9rem; color: #64748b; padding-top: 10px;'>Logged in as: <b>{st.session_state['user_email']}</b></div>",
         unsafe_allow_html=True)
-    if st.button("Log Out", use_container_width=True):
+    if st.button("Log Out", width="stretch"):
         cookie_manager.delete("user_email")
         time.sleep(0.2)
         st.session_state.clear()
@@ -418,14 +418,14 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
             "Stop at Ret.?": st.column_config.CheckboxColumn("Stop at Retirement?",
                                                              help="If checked, this income will automatically turn off when the specific owner reaches their chosen retirement year."),
             "Override Growth (%)": st.column_config.NumberColumn("Custom Growth (%)", step=0.1, format="%.1f%%")
-        }, num_rows="dynamic", use_container_width=True, hide_index=True, key="inc_editor"
+        }, num_rows="dynamic", width="stretch", hide_index=True, key="inc_editor"
     )
     render_total("Total Pre-Tax Income", f"${edited_inc['Annual Amount ($)'].sum():,.0f}")
 
     col_ai_inc, col_sv_inc = st.columns([3, 1])
     with col_ai_inc:
         st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("✨ Auto-Estimate My Social Security (AI)", use_container_width=True):
+        if st.button("✨ Auto-Estimate My Social Security (AI)", width="stretch"):
             with st.spinner("Asking AI to estimate your Social Security benefits based on your age and income..."):
                 curr_inc = sum([safe_num(x.get('Annual Amount ($)', 0)) for x in ud.get('income', [])])
                 if has_spouse:
@@ -451,7 +451,7 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
                     st.rerun()
     with col_sv_inc:
         st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("💾 Save Income", key="sv_2", use_container_width=True):
+        if st.button("💾 Save Income", key="sv_2", width="stretch"):
             save_requested = True
             st.toast("✅ Income Saved!", icon="💾")
 
@@ -492,7 +492,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
                 "Override Prop Growth (%)": st.column_config.NumberColumn("Property Growth (%)", step=0.1,
                                                                           format="%.1f%%"),
                 "Override Rent Growth (%)": st.column_config.NumberColumn("Rent Growth (%)", step=0.1, format="%.1f%%")
-            }, num_rows="dynamic", use_container_width=True, hide_index=True, key="re_editor"
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="re_editor"
         )
 
     with tab_biz:
@@ -519,7 +519,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
                                                                           format="%.1f%%"),
                 "Override Dist. Growth (%)": st.column_config.NumberColumn("Income Growth (%)", step=0.1,
                                                                            format="%.1f%%")
-            }, num_rows="dynamic", use_container_width=True, hide_index=True, key="biz_editor"
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="biz_editor"
         )
 
     with tab_ast:
@@ -554,7 +554,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
                 "Est. Annual Growth (%)": st.column_config.NumberColumn("Expected Return (%)", format="%.1f%%"),
                 "Stop Contrib at Ret.?": st.column_config.CheckboxColumn("Stop Adding at Ret.?",
                                                                          help="Check this if you will stop saving into this account once the owner retires.")
-            }, num_rows="dynamic", use_container_width=True, hide_index=True, key="assets_editor"
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="assets_editor"
         )
 
     with tab_debt:
@@ -576,7 +576,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
                 "Current Balance ($)": st.column_config.NumberColumn("Current Balance ($)", step=1000, format="$%d"),
                 "Interest Rate (%)": st.column_config.NumberColumn("Interest Rate (%)", step=0.001, format="%.3f%%"),
                 "Monthly Payment ($)": st.column_config.NumberColumn("Monthly Payment ($)", step=100, format="$%d")
-            }, num_rows="dynamic", use_container_width=True, hide_index=True, key="debt_editor"
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="debt_editor"
         )
 
     # Calculate Live Net Worth
@@ -599,7 +599,7 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
         unsafe_allow_html=True)
 
     st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-    if st.button("💾 Save Assets & Debts", key="sv_3", use_container_width=True):
+    if st.button("💾 Save Assets & Debts", key="sv_3", width="stretch"):
         save_requested = True
         st.toast("✅ Assets & Debts Saved!", icon="💾")
 
@@ -694,14 +694,14 @@ with st.expander("💸 4. Lifetime Cash Flows (Budgets & Milestones)", expanded=
             "End Year": st.column_config.NumberColumn("End Year (If Custom)", format="%d", min_value=1900,
                                                       max_value=2100),
             "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI?")
-        }, num_rows="dynamic", use_container_width=True, hide_index=True, key="exp_ed"
+        }, num_rows="dynamic", width="stretch", hide_index=True, key="exp_ed"
     )
 
     col_ai_cb, col_sv_cb = st.columns([3, 1])
     with col_ai_cb:
         st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
         if st.button("✨ Auto-Estimate Budget & Milestones for selected current and future locations (AI)",
-                     use_container_width=True):
+                     width="stretch"):
             with st.spinner("Analyzing localized CPI data, timelines, and family needs..."):
                 valid = edited_exp[edited_exp["Description"].astype(str) != ""].copy()
                 locked = valid[valid["AI Estimate?"] == False].to_dict('records')
@@ -717,7 +717,7 @@ with st.expander("💸 4. Lifetime Cash Flows (Budgets & Milestones)", expanded=
                     st.error("⚠️ AI returned an invalid format. Please try again.")
     with col_sv_cb:
         st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("💾 Save Cash Flows", key="sv_4", use_container_width=True):
+        if st.button("💾 Save Cash Flows", key="sv_4", width="stretch"):
             save_requested = True
             st.session_state['lifetime_expenses'] = edited_exp.to_dict('records')
             st.toast("✅ Cash Flows Saved!", icon="💾")
@@ -756,8 +756,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 sub_c2.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
                 sub_c2.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
 
-                if sub_c2.button("✨ AI", key=f"btn_{state_key}", help=f"AI Estimate for {label}",
-                                 use_container_width=True):
+                if sub_c2.button("✨ AI", key=f"btn_{state_key}", help=f"AI Estimate for {label}", width="stretch"):
                     with st.spinner("AI estimating..."):
                         enhanced_prompt = prompt + " CRITICAL INSTRUCTION: You MUST return the value as a percentage number between 0 and 100 (e.g., return 5.5 for 5.5%, DO NOT return 0.055)."
                         res = call_gemini_json(enhanced_prompt)
@@ -1056,8 +1055,8 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 is_retired = year >= primary_retire_year
                 is_spouse_retired = has_spouse and (year >= spouse_retire_year)
 
-                yd = {"Year": year, "Age (Primary)": my_current_age}
-                nw_yd = {"Year": year, "Age (Primary)": my_current_age}
+                yd = {"Year": year, "Age (Primary)": my_current_age, "Age (Spouse)": spouse_current_age}
+                nw_yd = {"Year": year, "Age (Primary)": my_current_age, "Age (Spouse)": spouse_current_age}
 
                 annual_inc, annual_ss, pre_tax_ord, pre_tax_cg = 0, 0, 0, 0
                 earned_income_me, earned_income_spouse, match_income = 0, 0, 0
@@ -1534,6 +1533,8 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 yd["Expense: Taxes"] = total_tax
 
                 # Robust Shortfall / Withdrawal Math
+                portfolio_income = 0
+                # We only deduct the EMPLOYEE portion of contributions from cash flow, not the Employer Match.
                 employee_contributions = max(0, asset_contributions - match_income)
                 if employee_contributions > 0:
                     yd["Expense: Portfolio Contributions"] = employee_contributions
@@ -1867,9 +1868,10 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                                 "Net Worth"]:
                         sim_results[i][col] /= discount
                     for k in detailed_results[i].keys():
-                        if k not in ["Age", "Year"]: detailed_results[i][k] /= discount
+                        if k not in ["Age (Primary)", "Age (Spouse)", "Year"]: detailed_results[i][k] /= discount
                     for k in nw_detailed_results[i].keys():
-                        if k not in ["Age", "Year"] and not isinstance(nw_detailed_results[i][k], str):
+                        if k not in ["Age (Primary)", "Age (Spouse)", "Year"] and not isinstance(
+                                nw_detailed_results[i][k], str):
                             nw_detailed_results[i][k] /= discount
 
             df_sim = pd.DataFrame(sim_results)
@@ -1969,7 +1971,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 fig_nw.update_layout(hovermode="x unified", yaxis=dict(tickformat="$,.0f"),
                                      margin=dict(l=0, r=0, t=30, b=0),
                                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                st.plotly_chart(fig_nw, use_container_width=True)
+                st.plotly_chart(fig_nw, width="stretch")
 
                 st.write("#### Annual Cash Flow & Progressive Taxes")
                 fig_cf = go.Figure()
@@ -2005,7 +2007,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 fig_cf.update_layout(hovermode="x unified", yaxis=dict(tickformat="$,.0f"),
                                      margin=dict(l=0, r=0, t=30, b=0),
                                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                st.plotly_chart(fig_cf, use_container_width=True)
+                st.plotly_chart(fig_cf, width="stretch")
 
                 # --- SANKEY DIAGRAM ---
                 st.divider()
@@ -2030,6 +2032,12 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                                k.startswith('Income:') and v > 0}
                     outflows = {k.replace('Expense: ', ''): v for k, v in row.items() if
                                 k.startswith('Expense:') and v > 0}
+
+                    net_savings = row.get('Net Savings', 0)
+                    if net_savings > 0:
+                        outflows['Net Savings & Investments'] = net_savings
+                    elif net_savings < 0:
+                        inflows['Shortfall Debt Funded'] = abs(net_savings)
 
                     in_labels = [f"{k}<br>${v:,.0f}" for k, v in inflows.items()]
                     out_labels = [f"{k}<br>${v:,.0f}" for k, v in outflows.items()]
@@ -2084,7 +2092,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                         )
                     )])
                     fig_sankey.update_layout(height=750, margin=dict(l=0, r=0, t=30, b=0), font=dict(size=12))
-                    st.plotly_chart(fig_sankey, use_container_width=True)
+                    st.plotly_chart(fig_sankey, width="stretch")
 
             # --- DATA AUDIT TABLES ---
             st.divider()
@@ -2097,22 +2105,24 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 st.subheader("Detailed Tax & Expense Log")
                 inc_c = sorted([c for c in df_det.columns if c.startswith("Income:") or c.startswith("Roth")])
                 exp_c = sorted([c for c in df_det.columns if c.startswith("Expense:")])
-                ord_det = ["Year", "Age"] + inc_c + exp_c + ["Net Savings"]
+                ord_det = ["Year", "Age (Primary)", "Age (Spouse)"] + inc_c + exp_c + ["Net Savings"]
                 st.dataframe(df_det[ord_det].set_index("Year").style.format(
-                    {c: "${:,.0f}" for c in ord_det if c not in ["Age", "Year"]} | {"Age": "{:.0f}"}),
-                             use_container_width=True)
+                    {c: "${:,.0f}" for c in ord_det if c not in ["Age (Primary)", "Age (Spouse)", "Year"]} | {
+                        "Age (Primary)": "{:.0f}", "Age (Spouse)": "{:.0f}"}), width="stretch")
 
             with t2:
                 st.subheader("Detailed Net Worth Log")
                 st.markdown(
                     "Track the exact, year-by-year balance of every single asset account and liability to trace your drawdowns and growth.")
                 ast_c = sorted([c for c in df_nw.columns if c.startswith("Asset:")])
-                ord_nw = ["Year", "Age"] + ast_c + ["Total Liquid Assets", "Total Real Estate Equity",
-                                                    "Total Business Equity", "Total Debt Liabilities",
-                                                    "Total Net Worth"]
+                ord_nw = ["Year", "Age (Primary)", "Age (Spouse)"] + ast_c + ["Total Liquid Assets",
+                                                                              "Total Real Estate Equity",
+                                                                              "Total Business Equity",
+                                                                              "Total Debt Liabilities",
+                                                                              "Total Net Worth"]
                 st.dataframe(df_nw[ord_nw].set_index("Year").style.format(
-                    {c: "${:,.0f}" for c in ord_nw if c not in ["Age", "Year"]} | {"Age": "{:.0f}"}),
-                             use_container_width=True)
+                    {c: "${:,.0f}" for c in ord_nw if c not in ["Age (Primary)", "Age (Spouse)", "Year"]} | {
+                        "Age (Primary)": "{:.0f}", "Age (Spouse)": "{:.0f}"}), width="stretch")
 
 # --- AI FIDUCIARY REPORT (BOTTOM ANCHORED) ---
 st.markdown("---")
@@ -2123,7 +2133,7 @@ st.markdown(
 c_ai_rep, _ = st.columns([1, 2])
 with c_ai_rep:
     st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
-    if st.button("✨ Generate Comprehensive AI Report", use_container_width=True):
+    if st.button("✨ Generate Comprehensive AI Report", width="stretch"):
         with st.spinner("AI extracting timeseries data and acting as fiduciary advisor..."):
             if 'sim_results' in locals() and len(sim_results) > 0:
                 sim_summary = {
@@ -2168,8 +2178,7 @@ if 'ai_analysis_report' in st.session_state:
 # --- FINAL SAVE CORE ---
 st.markdown("---")
 st.markdown('<div class="main-save-btn-marker"></div>', unsafe_allow_html=True)
-if st.button("🚀 Save Full Profile to Cloud Server", type="primary", use_container_width=True,
-             key="save_main") or save_requested:
+if st.button("🚀 Save Full Profile to Cloud Server", type="primary", width="stretch", key="save_main") or save_requested:
     if st.session_state['user_email'] == "guest_demo":
         st.error("Persistent configurations disabled within the demonstration environment.")
     else:
