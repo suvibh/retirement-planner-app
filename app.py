@@ -34,6 +34,10 @@ CATCHUP_401K_BASE = 7500
 CATCHUP_IRA_BASE = 1000
 MEDICARE_GAP_COST = 15000
 LTC_SHOCK_COST = 100000
+SHORTFALL_PENALTY_RATE = 0.12  # 12% Annual Penalty on Unfunded Debt
+WIDOW_EXPENSE_MULTIPLIER = 0.60
+MEDICARE_CLIFF_SINGLE_DROP = 0.25  # 25% drop per spouse going on Medicare
+ROTH_CASH_BUFFER_MARGIN = 0.95
 
 # --- GOOGLE ANALYTICS INJECTION ---
 GA_MEASUREMENT_ID = st.secrets.get("GA_MEASUREMENT_ID", "")
@@ -87,24 +91,6 @@ st.markdown("""
     div[data-testid="stElementContainer"]:has(.ai-btn-marker) + div[data-testid="stElementContainer"] button:hover {
         transform: translateY(-2px);
         box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.39) !important;
-    }
-
-    /* Save Button subtle styling */
-    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button,
-    div[data-testid="stElementContainer"]:has(.save-btn-marker) + div[data-testid="stElementContainer"] button {
-        background-color: #f0fdf4 !important;
-        border: 1px solid #bbf7d0 !important;
-        color: #166534 !important;
-        font-weight: 600 !important;
-        border-radius: 8px !important;
-        transition: all 0.2s ease !important;
-    }
-    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button:hover,
-    div[data-testid="stElementContainer"]:has(.save-btn-marker) + div[data-testid="stElementContainer"] button:hover {
-        background-color: #dcfce7 !important;
-        border-color: #86efac !important;
-        transform: translateY(-2px);
-        box-shadow: 0 4px 12px rgba(22, 101, 52, 0.15) !important;
     }
 
     /* Main Action Button (Bottom Save) */
@@ -177,41 +163,45 @@ def load_user_data(email):
     return doc.to_dict() if doc.exists else {}
 
 
-def call_gemini_json(prompt):
+def call_gemini_json(prompt, retries=3):
     if not GEMINI_API_KEY:
         st.error("⚠️ GEMINI_API_KEY is missing in Streamlit Secrets. AI operations are temporarily disabled.")
         return None
     url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={GEMINI_API_KEY}"
     payload = {"contents": [{"parts": [{"text": prompt}]}],
                "generationConfig": {"responseMimeType": "application/json"}}
-    try:
-        res = requests.post(url, json=payload).json()
-        if "error" in res:
-            st.error(f"⚠️ API Error: {res['error'].get('message')}")
-            return None
-        text = res['candidates'][0]['content']['parts'][0]['text'].strip()
-        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text).strip()
-        parsed = json.loads(text)
-        if isinstance(parsed, dict) and len(parsed) == 1 and isinstance(list(parsed.values())[0], list): return \
-        list(parsed.values())[0]
-        return parsed
-    except Exception as e:
-        st.error(f"⚠️ Failed to parse AI response. Expected structured JSON.")
-        return None
+
+    for attempt in range(retries):
+        try:
+            res = requests.post(url, json=payload).json()
+            if "error" in res:
+                if attempt == retries - 1:
+                    st.error(f"⚠️ API Error: {res['error'].get('message')}")
+                    return None
+                time.sleep(2 ** attempt)
+                continue
+
+            text = res['candidates'][0]['content']['parts'][0]['text'].strip()
+            text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text).strip()
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and len(parsed) == 1 and isinstance(list(parsed.values())[0], list): return \
+            list(parsed.values())[0]
+            return parsed
+        except Exception:
+            time.sleep(2 ** attempt)
+    return None
 
 
 def subtract_years(dt, years):
-    try:
-        return dt.replace(year=dt.year - years)
-    except ValueError:
-        return dt.replace(year=dt.year - years, day=28)
+    return dt - relativedelta(years=years)
 
 
 def safe_num(val, default=0.0):
     try:
-        if val is None or str(val).strip() == "": return default
+        if val is None: return default
         if pd.isna(val): return default
+        if str(val).strip() == "": return default
         return float(val)
     except Exception:
         return default
@@ -311,9 +301,10 @@ def city_autocomplete(label, key_prefix, default_val=""):
     return current_val
 
 
-def render_total(label, text):
+def render_total(label, series):
+    total = pd.to_numeric(series, errors='coerce').fillna(0).sum()
     st.markdown(
-        f"<div style='text-align: right; font-weight: 600; color: #4f46e5; font-size: 1.1rem;'>{label}: <span style='color: #111827;'>{text}</span></div>",
+        f"<div style='text-align: right; font-weight: 600; color: #4f46e5; font-size: 1.1rem;'>{label}: <span style='color: #111827;'>${total:,.0f}</span></div>",
         unsafe_allow_html=True)
 
 
@@ -389,7 +380,6 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
         '<div class="info-text">💡 <strong>Employer Match Note:</strong> Employer 401(k) matches are considered part of your total compensation, but are <strong>not</strong> spendable cash income. Professionally, you should list the match here for visibility. The engine will intelligently auto-deposit it into your assets so your balances grow correctly.</div>',
         unsafe_allow_html=True)
 
-    # Preemptively fetch session state edits to prevent wiping un-saved manual inputs on AI rerun
     df_inc = pd.DataFrame(st.session_state.get('income', ud.get('income', [])))
     if df_inc.empty:
         df_inc = pd.DataFrame(
@@ -425,17 +415,23 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
             "Override Growth (%)": st.column_config.NumberColumn("Custom Growth (%)", step=0.1, format="%.1f%%")
         }, num_rows="dynamic", width="stretch", hide_index=True, key="inc_editor"
     )
-    render_total("Total Pre-Tax Income", f"${edited_inc['Annual Amount ($)'].sum():,.0f}")
+
+    # Validation Warning for missing End Years to prevent infinite income loops
+    for idx, inc in edited_inc.iterrows():
+        if not inc.get("Stop at Ret.?") and (pd.isna(inc.get("End Year")) or str(inc.get("End Year")).strip() == ""):
+            st.warning(
+                f"⚠️ Income '{inc.get('Description', 'Unknown')}': 'Stop at Retirement' is unchecked, but no 'End Year' is provided. This income will continue indefinitely until the simulation ends.")
+
+    render_total("Total Pre-Tax Income", edited_inc['Annual Amount ($)'])
 
     col_ai_inc, _ = st.columns([3, 1])
     with col_ai_inc:
         st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
         if st.button("✨ Auto-Estimate My Social Security (AI)", width="stretch"):
-            # Save UI state before rerun
-            st.session_state['income'] = edited_inc.to_dict('records')
+            st.session_state['income'] = edited_inc.to_dict('records')  # Save UI state before rerun
 
             with st.spinner("Asking AI to estimate your Social Security benefits based on your age and income..."):
-                curr_inc = sum([safe_num(x.get('Annual Amount ($)', 0)) for x in ud.get('income', [])])
+                curr_inc = pd.to_numeric(edited_inc['Annual Amount ($)'], errors='coerce').fillna(0).sum()
                 if has_spouse:
                     prompt = f"User is {my_age} years old making ${curr_inc}/year. Spouse is {spouse_age} years old. Estimate realistic annual Social Security primary insurance amounts (PIA) at Full Retirement Age for both. Return JSON: {{'ss_amount_me': integer, 'ss_amount_spouse': integer}}"
                 else:
@@ -529,8 +525,8 @@ with st.expander("🏦 3. Assets, Debts & Net Worth", expanded=False):
                 "Annual Distribution ($)": st.column_config.NumberColumn("Annual Income ($)", step=1000, format="$%d"),
                 "Your Ownership (%)": st.column_config.NumberColumn("Your Ownership (%)", min_value=0, max_value=100,
                                                                     format="%d%%"),
-                "Override Val. Growth (%)": st.column_config.NumberColumn("Value Growth (%)", step=0.1,
-                                                                          format="%.1f%%"),
+                "Override Val. Growth (%)": st.column_config.NumberColumn("Value Growth (%)", step=0.1, format="%.1f%%",
+                                                                          help="This private asset will inherently not follow the portfolio glidepath. Use this to set a static growth rate."),
                 "Override Dist. Growth (%)": st.column_config.NumberColumn("Income Growth (%)", step=0.1,
                                                                            format="%.1f%%")
             }, num_rows="dynamic", width="stretch", hide_index=True, key="biz_editor"
@@ -884,7 +880,9 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                                     help="Removes the effect of inflation so you can easily understand what these big future numbers feel like today.")
 
     # --- SIMULATION ENGINE ---
-    if my_age > 0:
+    if my_age == 0:
+        st.warning("Please enter a valid Date of Birth to generate the simulation.")
+    else:
 
         # --- PROGRESSIVE IRS FEDERAL TAX CALCULATOR ---
         def calc_federal_tax(ordinary_income, is_mfj, year_offset, inflation_rate):
@@ -936,22 +934,20 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
 
         # --- SOCIAL SECURITY FRA MATH ---
-        def get_ss_multi(birth_year, r_age):
+        def get_ss_multi(birth_year, claim_year):
             fra = 67 if birth_year >= 1960 else (66 + (min(birth_year - 1954, 10) / 12.0) if birth_year >= 1955 else 66)
-            if r_age < fra:
-                months_early = (fra - r_age) * 12
+            claim_age = claim_year - birth_year
+            if claim_age < fra:
+                months_early = (fra - claim_age) * 12
                 if months_early <= 36:
                     return 1.0 - (months_early * (5 / 9 * 0.01))
                 else:
                     return 1.0 - (36 * (5 / 9 * 0.01)) - ((months_early - 36) * (5 / 12 * 0.01))
-            elif r_age > fra:
-                months_late = min((r_age - fra) * 12, (70 - fra) * 12)  # Strict cap at age 70
+            elif claim_age > fra:
+                months_late = min((claim_age - fra) * 12, (70 - fra) * 12)  # Strict cap at age 70
                 return 1.0 + (months_late * (2 / 3 * 0.01))
             return 1.0
 
-
-        my_ss_multi = get_ss_multi(my_birth_year, ret_age)
-        spouse_ss_multi = get_ss_multi(spouse_birth_year, s_ret_age) if has_spouse else 1.0
 
         irs_uniform_table = {73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1, 80: 20.2, 81: 19.4,
                              82: 18.5, 83: 17.7, 84: 16.8, 85: 16.0, 86: 15.2, 87: 14.4, 88: 13.7, 89: 12.9, 90: 12.2,
@@ -997,8 +993,8 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
             'medicare_gap': medicare_gap, 'medicare_cliff': medicare_cliff, 'ltc_shock': ltc_shock,
             'roth_conversions': roth_conversions, 'roth_target': roth_target,
             'active_withdrawal_strategy': active_withdrawal_strategy,
-            'my_ss_multi': my_ss_multi, 'spouse_ss_multi': spouse_ss_multi, 'owns_home': owns_home,
-            'kids_data': kids_data, 'max_years': max_years, 'max_year': max_year, 'my_life_exp_val': my_life_exp_val,
+            'owns_home': owns_home, 'kids_data': kids_data, 'max_years': max_years, 'max_year': max_year,
+            'my_life_exp_val': my_life_exp_val, 'spouse_life_exp_val': spouse_life_exp_val,
             'ast_records': ast_records, 'debt_records': debt_records, 're_records': re_records,
             'biz_records': biz_records, 'inc_records': inc_records, 'exp_records': exp_records
         }
@@ -1027,19 +1023,44 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                        "pmt": safe_num(r.get("Mortgage Payment ($)")) * 12,
                        "exp": safe_num(r.get("Monthly Expenses ($)")) * 12,
                        "rent": safe_num(r.get("Monthly Rent ($)")) * 12,
-                       "v_growth": safe_num(r.get("Override Prop Growth (%)"), ctx['prop_g']),
-                       "r_growth": safe_num(r.get("Override Rent Growth (%)"), ctx['rent_g']),
+                       "v_growth": float(r.get("Override Prop Growth (%)")) if pd.notna(
+                           r.get("Override Prop Growth (%)")) and str(
+                           r.get("Override Prop Growth (%)")).strip() != "" else ctx['prop_g'],
+                       "r_growth": float(r.get("Override Rent Growth (%)")) if pd.notna(
+                           r.get("Override Rent Growth (%)")) and str(
+                           r.get("Override Rent Growth (%)")).strip() != "" else ctx['rent_g'],
                        "rate": safe_num(r.get("Interest Rate (%)")) / 100} for r in ctx['re_records'] if
                       r.get("Property Name")]
             sim_biz = [{"name": b.get("Business Name"), "val": safe_num(b.get("Total Valuation ($)")),
                         "own": safe_num(b.get("Your Ownership (%)")) / 100.0,
                         "dist": safe_num(b.get("Annual Distribution ($)")),
-                        "v_growth": safe_num(b.get("Override Val. Growth (%)"), ctx['mkt']),
-                        "d_growth": safe_num(b.get("Override Dist. Growth (%)"), ctx['inc_g'])} for b in
+                        "v_growth": float(b.get("Override Val. Growth (%)")) if pd.notna(
+                            b.get("Override Val. Growth (%)")) and str(
+                            b.get("Override Val. Growth (%)")).strip() != "" else ctx['mkt'],
+                        "d_growth": float(b.get("Override Dist. Growth (%)")) if pd.notna(
+                            b.get("Override Dist. Growth (%)")) and str(
+                            b.get("Override Dist. Growth (%)")).strip() != "" else ctx['inc_g']} for b in
                        ctx['biz_records'] if b.get("Business Name")]
 
             unfunded_debt_bal = 0
             prev_unfunded_debt_bal = 0
+            last_irmaa_tier = 0
+
+            # Pre-calculate SS actual starting entitlements (Base Amount * FRA multiplier)
+            primary_ss_record = next(
+                (r for r in ctx['inc_records'] if r.get('Category') == 'Social Security' and r.get('Owner') == 'Me'),
+                None)
+            spouse_ss_record = next((r for r in ctx['inc_records'] if
+                                     r.get('Category') == 'Social Security' and r.get('Owner') == 'Spouse'), None)
+
+            primary_ss_start_year = safe_num(primary_ss_record['Start Year'],
+                                             ctx['current_year']) if primary_ss_record else 9999
+            spouse_ss_start_year = safe_num(spouse_ss_record['Start Year'],
+                                            ctx['current_year']) if spouse_ss_record else 9999
+
+            primary_ss_multi = get_ss_multi(ctx['my_birth_year'], primary_ss_start_year)
+            spouse_ss_multi = get_ss_multi(ctx['spouse_birth_year'], spouse_ss_start_year)
+
             sim_res, det_res, nw_det_res = [], [], []
             milestones_by_year = {}
 
@@ -1058,7 +1079,6 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
             prev_debt_bals = {d['name']: d['bal'] for d in sim_debts}
             prev_re_debts = {r['name']: r['debt'] for r in sim_re}
             prev_ast_bals = {a['Account Name']: a['bal'] for a in sim_assets}
-            prev_unfunded_debt_bal = 0
 
             for year_offset in range(ctx['max_years'] + 1):
                 year = ctx['current_year'] + year_offset
@@ -1071,9 +1091,12 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 if not is_my_alive and not is_spouse_alive:
                     break
 
-                # 1. Base Setup & Milestones
+                # 1. Unfunded Debt Accrues Interest (Prior year balance compounds first)
                 prev_unfunded_debt_bal = unfunded_debt_bal
+                if unfunded_debt_bal > 0:
+                    unfunded_debt_bal *= (1 + SHORTFALL_PENALTY_RATE)
 
+                    # 2. Base Setup & Milestones
                 if ctx['has_spouse'] and not is_spouse_alive and not spouse_died_notified:
                     if year not in milestones_by_year: milestones_by_year[year] = []
                     milestones_by_year[year].append(
@@ -1110,16 +1133,17 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     if year not in milestones_by_year: milestones_by_year[year] = []
                     milestones_by_year[year].append({"desc": "🏦 Spouse RMDs Begin", "amt": 0, "type": "system"})
 
+                # Retire check for lifestyle drops
                 is_retired = year >= ctx['primary_retire_year']
 
                 yd = {"Year": year, "Age (Primary)": my_current_age, "Age (Spouse)": spouse_current_age}
                 nw_yd = {"Year": year, "Age (Primary)": my_current_age, "Age (Spouse)": spouse_current_age}
 
-                annual_inc, annual_ss, pre_tax_ord, pre_tax_cg = 0, 0, 0, 0
+                annual_inc, annual_ss, pre_tax_ord = 0, 0, 0
                 earned_income_me, earned_income_spouse = 0, 0
                 match_income_by_owner = {"Me": 0, "Spouse": 0, "Joint": 0}
 
-                # 2. Market Returns (Stress Test vs Glidepath)
+                # 3. Market Returns (Stress Test vs Glidepath)
                 base_mkt_yr = mkt_sequence[year_offset]
                 if ctx['stress_test'] and year == ctx['primary_retire_year']:
                     mkt_glide = -25.0
@@ -1134,7 +1158,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
                 active_mfj = True if ctx['has_spouse'] and is_my_alive and is_spouse_alive else False
 
-                # 3. RMDs (Calculated strictly on Prior Year Dec 31st Balance before any growth or contribs)
+                # 4. RMDs (Calculated strictly on Prior Year Dec 31st Balance before any new year growth or contribs)
                 rmd_income = 0
                 for a in sim_assets:
                     if a.get('Type') in ['Traditional 401(k)', 'Traditional IRA'] and a['bal'] > 0:
@@ -1154,9 +1178,9 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     annual_inc += rmd_income
                     yd["Income: RMDs"] = rmd_income
 
-                # 4. Income Generation
-                primary_ss_amt = 0
-                spouse_ss_amt = 0
+                # 5. Income Generation
+                primary_ss_entitlement = 0
+                spouse_ss_entitlement = 0
 
                 for inc in ctx['inc_records']:
                     owner = inc.get("Owner", "Me")
@@ -1176,26 +1200,32 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     else:
                         is_active = (start_year <= year <= end_year)
 
-                    if inc.get("Description") and is_active:
+                    if inc.get("Description"):
                         g = safe_num(inc.get('Override Growth (%)'), ctx['inc_g'])
                         base_amt = safe_num(inc.get('Annual Amount ($)'))
-                        offset_for_growth = max(0, year - ctx['current_year'])
 
                         if cat_name == "Social Security":
-                            # SS multiplier applied ONCE to base, then grown via COLA
-                            adjusted_base = base_amt * (ctx['my_ss_multi'] if owner == "Me" else ctx['spouse_ss_multi'])
-                            amt = adjusted_base * ((1 + ctx['infl'] / 100) ** offset_for_growth)
+                            # Process entitlement internally regardless of is_active to allow survivor logic to accurately inherit
                             if owner == "Me":
-                                primary_ss_amt = amt
+                                adjusted_base = base_amt * primary_ss_multi
+                                offset = max(0, year - primary_ss_start_year)
+                                primary_ss_entitlement = adjusted_base * ((1 + ctx['infl'] / 100) ** offset)
                             elif owner == "Spouse":
-                                spouse_ss_amt = amt
+                                adjusted_base = base_amt * spouse_ss_multi
+                                offset = max(0, year - spouse_ss_start_year)
+                                spouse_ss_entitlement = adjusted_base * ((1 + ctx['infl'] / 100) ** offset)
                             continue
 
+                        if not is_active: continue
+
+                        offset_for_growth = max(0, year - ctx['current_year'])
                         amt = base_amt * ((1 + g / 100) ** offset_for_growth)
 
                         # Hide 401(k) match from spendable income completely, but track it to auto-deposit to assets
                         if cat_name == "Employer Match (401k/HSA)":
-                            match_income_by_owner[owner] += amt
+                            if (owner == "Me" and is_my_alive) or (owner == "Spouse" and is_spouse_alive) or (
+                                    owner == "Joint" and (is_my_alive or is_spouse_alive)):
+                                match_income_by_owner[owner] += amt
                             continue
 
                         if owner == "Me" and not is_my_alive: continue
@@ -1214,28 +1244,46 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 # Spousal SS Survivor Benefits & Taxation (Tax Torpedo Logic)
                 active_ss = 0
                 if is_my_alive and is_spouse_alive:
-                    active_ss = primary_ss_amt + spouse_ss_amt
+                    if year >= primary_ss_start_year: active_ss += primary_ss_entitlement
+                    if year >= spouse_ss_start_year: active_ss += spouse_ss_entitlement
+
+                    if primary_ss_entitlement > 0 and year >= primary_ss_start_year and not ss_started_me:
+                        if year not in milestones_by_year: milestones_by_year[year] = []
+                        milestones_by_year[year].append(
+                            {"desc": "📈 Social Security Begins (You)", "amt": primary_ss_entitlement, "type": "system"})
+                        ss_started_me = True
+                    if spouse_ss_entitlement > 0 and year >= spouse_ss_start_year and not ss_started_spouse:
+                        if year not in milestones_by_year: milestones_by_year[year] = []
+                        milestones_by_year[year].append(
+                            {"desc": "📈 Social Security Begins (Spouse)", "amt": spouse_ss_entitlement,
+                             "type": "system"})
+                        ss_started_spouse = True
                 elif is_my_alive and not is_spouse_alive:
-                    active_ss = max(primary_ss_amt,
-                                    spouse_ss_amt)  # Per SSA rules, survivor inherits the higher of the two benefits
+                    primary_actual = primary_ss_entitlement if year >= primary_ss_start_year else 0
+                    survivor_benefit = max(primary_ss_entitlement,
+                                           spouse_ss_entitlement)  # Per SSA rules, survivor inherits the higher of the two
+                    active_ss = max(primary_actual, survivor_benefit)
+
+                    if active_ss > 0 and not ss_started_me:
+                        if year not in milestones_by_year: milestones_by_year[year] = []
+                        milestones_by_year[year].append(
+                            {"desc": "📈 Social Security Survivor Benefit Begins", "amt": active_ss, "type": "system"})
+                        ss_started_me = True
                 elif is_spouse_alive and not is_my_alive:
-                    active_ss = max(primary_ss_amt, spouse_ss_amt)
+                    spouse_actual = spouse_ss_entitlement if year >= spouse_ss_start_year else 0
+                    survivor_benefit = max(primary_ss_entitlement, spouse_ss_entitlement)
+                    active_ss = max(spouse_actual, survivor_benefit)
+
+                    if active_ss > 0 and not ss_started_spouse:
+                        if year not in milestones_by_year: milestones_by_year[year] = []
+                        milestones_by_year[year].append(
+                            {"desc": "📈 Social Security Survivor Benefit Begins", "amt": active_ss, "type": "system"})
+                        ss_started_spouse = True
 
                 if active_ss > 0:
                     annual_inc += active_ss
                     annual_ss += active_ss
                     yd["Income: Social Security"] = active_ss
-
-                    if primary_ss_amt > 0 and not ss_started_me and is_my_alive:
-                        if year not in milestones_by_year: milestones_by_year[year] = []
-                        milestones_by_year[year].append(
-                            {"desc": "📈 Social Security Begins (You)", "amt": primary_ss_amt, "type": "system"})
-                        ss_started_me = True
-                    if spouse_ss_amt > 0 and not ss_started_spouse and is_spouse_alive:
-                        if year not in milestones_by_year: milestones_by_year[year] = []
-                        milestones_by_year[year].append(
-                            {"desc": "📈 Social Security Begins (Spouse)", "amt": spouse_ss_amt, "type": "system"})
-                        ss_started_spouse = True
 
                     # Calculate Provisional Income & Taxable SS Portion using strict IRS tier band math
                     ss_provisional_income = pre_tax_ord + (active_ss * 0.5)
@@ -1257,7 +1305,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                             taxable_ss = min(0.85 * active_ss, 0.85 * (ss_provisional_income - 34000) + tier1_max)
                     pre_tax_ord += taxable_ss
 
-                # 5. Business & Real Estate
+                # 6. Business & Real Estate
                 cur_biz_val, re_equity = 0, 0
                 total_exp = 0  # Initialize general expenses
                 biz_income_total = 0
@@ -1339,78 +1387,10 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     taxable_rent = max(0, r['rent'] - r['exp'] - interest_paid)
                     pre_tax_ord += taxable_rent
 
-                # Tax Base Ord protects QBI deduction without mutating the actual pre_tax_ord (needed for IRMAA)
+                # Tax Base Ord protects QBI deduction without mutating the actual pre_tax_ord (needed accurately for IRMAA MAGI)
                 tax_base_ord = max(0, pre_tax_ord - qbi_deduction)
 
-                # 6. Roth Conversion Optimizer (Executes before mid-year growth)
-                state_tax_rate = ctx['cur_t'] if not is_retired else ctx['ret_t']
-                total_converted = 0
-                if ctx['roth_conversions'] and is_retired:
-                    infl_factor = (1 + ctx['infl'] / 100) ** year_offset
-                    std_deduction = (29200 if active_mfj else 14600) * infl_factor
-
-                    b_limits_mfj = {"12%": 94300, "22%": 201050, "24%": 383900, "32%": 487450}
-                    b_limits_single = {"12%": 47150, "22%": 100525, "24%": 191950, "32%": 243725}
-
-                    b_limits = b_limits_mfj if active_mfj else b_limits_single
-                    target_limit = b_limits.get(ctx['roth_target'], 383900) * infl_factor
-                    target_max_income = target_limit + std_deduction
-
-                    conversion_room = max(0, target_max_income - tax_base_ord)
-
-                    # GUARDRAIL: Only convert what can be comfortably paid by existing liquid cash
-                    base_fed_tax, marginal_rate = calc_federal_tax(tax_base_ord + conversion_room, active_mfj,
-                                                                   year_offset, ctx['infl'])
-                    est_tax_rate = marginal_rate + (state_tax_rate / 100.0)
-
-                    available_cash = sum(a['bal'] for a in sim_assets if
-                                         a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)',
-                                                           'Unallocated Cash'])
-
-                    # Compute safe conversion buffer by deducting known living expenses
-                    safe_liquid_cash = max(0, available_cash - total_exp)
-                    max_tax_budget = safe_liquid_cash * 0.95  # Safe 5% margin
-                    max_conversion_by_cash = max_tax_budget / max(0.10, est_tax_rate)
-
-                    conversion_room = min(conversion_room, max_conversion_by_cash)
-
-                    if conversion_room > 0:
-                        for a in sim_assets:
-                            if a.get('Type') in ['Traditional 401(k)', 'Traditional IRA'] and a['bal'] > 0:
-                                convert_amt = min(a['bal'], conversion_room - total_converted)
-                                if convert_amt > 0:
-                                    a['bal'] -= convert_amt
-                                    total_converted += convert_amt
-
-                                    roth_found = False
-                                    for roth_a in sim_assets:
-                                        if roth_a.get('Type') in ['Roth 401(k)', 'Roth IRA'] and roth_a.get(
-                                                'Owner') == a.get('Owner'):
-                                            roth_a['bal'] += convert_amt
-                                            roth_found = True
-                                            break
-                                    if not roth_found:
-                                        sim_assets.append({
-                                            "Account Name": f"Converted Roth ({a.get('Owner')})",
-                                            "Type": "Roth IRA",
-                                            "Owner": a.get("Owner", "Me"),
-                                            "bal": convert_amt,
-                                            "contrib": 0.0,
-                                            "growth": a.get('growth'),
-                                            "stop_at_ret": True
-                                        })
-                                if total_converted >= conversion_room:
-                                    break
-
-                        if total_converted > 0:
-                            pre_tax_ord += total_converted
-                            tax_base_ord += total_converted
-                            yd["Roth Conversion Amount"] = total_converted
-                            # The resulting tax liability is inherently captured by the year-end
-                            # "total_tax" calculation, which dynamically expands the shortfall
-                            # waterfall to successfully draw the tax from cash reserves verified above.
-
-                # 7. Unified Lifetime Cash Flows Engine
+                # 7. Unified Lifetime Cash Flows Engine (Expenses)
                 for ev in ctx['exp_records']:
                     desc = str(ev.get("Description", "")).strip()
                     if not desc: continue
@@ -1456,15 +1436,20 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                                                                                                         "Healthcare",
                                                                                                         "Insurance",
                                                                                                         "Housing / Rent"]:
-                            if is_retired:
-                                inflated_amt *= 0.6
+                            if year >= ctx['primary_retire_year']:
+                                inflated_amt *= WIDOW_EXPENSE_MULTIPLIER
 
-                        # Medicare Cliff logic (Applies to both spouses)
+                        # Medicare Cliff logic (Proportional Reduction)
                         primary_on_medicare = is_my_alive and my_current_age >= 65
                         spouse_on_medicare = ctx['has_spouse'] and is_spouse_alive and spouse_current_age >= 65
-                        if ctx['medicare_cliff'] and cat == "Healthcare" and (
-                                primary_on_medicare or spouse_on_medicare):
-                            inflated_amt *= 0.50
+
+                        if ctx['medicare_cliff'] and cat == "Healthcare":
+                            # Only apply the cliff if the user's start year was explicitly pre-medicare
+                            if actual_start < (ctx['my_birth_year'] + 65):
+                                reduction = 1.0
+                                if primary_on_medicare: reduction -= MEDICARE_CLIFF_SINGLE_DROP
+                                if spouse_on_medicare: reduction -= MEDICARE_CLIFF_SINGLE_DROP
+                                inflated_amt *= max(0.5, reduction)
 
                         total_exp += inflated_amt
 
@@ -1564,12 +1549,172 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     prev_debt_bals[d['name']] = d['bal']
                     debt_bal_total += d['bal']
 
-                # 8. Asset Contributions & Market Growth (Mid-Year Convention)
+                # 8. Out-of-Pocket Asset Contributions & Base Federal Taxes
                 user_out_of_pocket_contribs = 0
+                person_401k_contribs = {'Me': 0, 'Spouse': 0, 'Joint': 0}
 
                 # IRA / 401k Limit Tracker
                 plan_401k_limit = PLAN_401K_LIMIT_BASE * ((1 + ctx['infl'] / 100) ** year_offset)
                 catchup_401k = CATCHUP_401K_BASE * ((1 + ctx['infl'] / 100) ** year_offset)
+                ira_limit = IRA_LIMIT_BASE * ((1 + ctx['infl'] / 100) ** year_offset)
+                catchup_ira = CATCHUP_IRA_BASE * ((1 + ctx['infl'] / 100) ** year_offset)
+
+                # Pre-calculate what out-of-pocket contributions will actually hit the cash flow requirement
+                for a in sim_assets:
+                    owner = a.get('Owner', 'Me')
+                    owner_retire_year = ctx['primary_retire_year'] if owner in ['Me', 'Joint'] else ctx[
+                        'spouse_retire_year']
+                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
+                    is_owner_alive = is_my_alive if owner in ['Me', 'Joint'] else is_spouse_alive
+
+                    if is_owner_alive:
+                        stop_contrib = a.get('stop_at_ret', True)
+                        if not (stop_contrib and year >= owner_retire_year):
+                            added_this_year = a['contrib']
+
+                            # Hard cap IRS Limits Per Person
+                            if a.get('Type') in ['Traditional 401(k)', 'Roth 401(k)']:
+                                limit = plan_401k_limit + (catchup_401k if owner_age >= 50 else 0)
+                                added_this_year = min(added_this_year, max(0, limit - person_401k_contribs[owner]))
+                                person_401k_contribs[owner] += added_this_year
+                            elif a.get('Type') in ['Traditional IRA', 'Roth IRA']:
+                                limit = ira_limit + (catchup_ira if owner_age >= 50 else 0)
+                                added_this_year = min(added_this_year, limit)  # Simplified IRA limit tracker
+
+                            user_out_of_pocket_contribs += added_this_year
+
+                state_tax_rate = ctx['cur_t'] if not is_retired else ctx['ret_t']
+                # Determine baseline pre-conversion tax for the cash guardrail calculation
+                base_fed_tax_pre_conversion, marginal_rate = calc_federal_tax(tax_base_ord, active_mfj, year_offset,
+                                                                              ctx['infl'])
+                base_state_tax_pre_conversion = tax_base_ord * (state_tax_rate / 100.0)
+
+                # 9. Roth Conversion Optimizer
+                total_converted = 0
+                if ctx['roth_conversions'] and is_retired:
+                    infl_factor = (1 + ctx['infl'] / 100) ** year_offset
+                    std_deduction = (29200 if active_mfj else 14600) * infl_factor
+
+                    b_limits_mfj = {"12%": 94300, "22%": 201050, "24%": 383900, "32%": 487450}
+                    b_limits_single = {"12%": 47150, "22%": 100525, "24%": 191950, "32%": 243725}
+
+                    b_limits = b_limits_mfj if active_mfj else b_limits_single
+                    target_limit = b_limits.get(ctx['roth_target'], 383900) * infl_factor
+                    target_max_income = target_limit + std_deduction
+
+                    conversion_room = max(0, target_max_income - tax_base_ord)
+
+                    # EXACT GUARDRAIL: We deduct all known expenses, out-of-pocket contributions, and base taxes from cash before attempting conversion
+                    available_cash = sum(a['bal'] for a in sim_assets if
+                                         a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)',
+                                                           'Unallocated Cash'])
+                    locked_outflows = total_exp + user_out_of_pocket_contribs + base_fed_tax_pre_conversion + base_state_tax_pre_conversion
+                    safe_liquid_cash = max(0, available_cash - locked_outflows)
+
+                    est_tax_rate = marginal_rate + (state_tax_rate / 100.0)
+                    max_tax_budget = safe_liquid_cash * ROTH_CASH_BUFFER_MARGIN
+                    max_conversion_by_cash = max_tax_budget / max(0.10, est_tax_rate)
+
+                    conversion_room = min(conversion_room, max_conversion_by_cash)
+
+                    if conversion_room > 0:
+                        for a in sim_assets:
+                            if a.get('Type') in ['Traditional 401(k)', 'Traditional IRA'] and a['bal'] > 0:
+                                convert_amt = min(a['bal'], conversion_room - total_converted)
+                                if convert_amt > 0:
+                                    a['bal'] -= convert_amt
+                                    total_converted += convert_amt
+
+                                    roth_found = False
+                                    for roth_a in sim_assets:
+                                        if roth_a.get('Type') in ['Roth 401(k)', 'Roth IRA'] and roth_a.get(
+                                                'Owner') == a.get('Owner'):
+                                            roth_a['bal'] += convert_amt
+                                            roth_found = True
+                                            break
+                                    if not roth_found:
+                                        sim_assets.append({
+                                            "Account Name": f"Converted Roth ({a.get('Owner')})",
+                                            "Type": "Roth IRA",
+                                            "Owner": a.get("Owner", "Me"),
+                                            "bal": convert_amt,
+                                            "contrib": 0.0,
+                                            "growth": a.get('growth'),
+                                            "stop_at_ret": True
+                                        })
+                                if total_converted >= conversion_room:
+                                    break
+
+                        if total_converted > 0:
+                            pre_tax_ord += total_converted
+                            tax_base_ord += total_converted
+                            yd["Roth Conversion Amount"] = total_converted
+
+                # 10. Finalize Taxes (Including conversions) & Run IRMAA
+                base_fed_tax, marginal_rate = calc_federal_tax(tax_base_ord, active_mfj, year_offset, ctx['infl'])
+                state_tax = tax_base_ord * (state_tax_rate / 100.0)
+
+                # FICA Tax (Indexed for inflation)
+                fica_tax = 0
+                ss_wage_base = SS_WAGE_BASE_2026 * ((1 + ctx['infl'] / 100) ** year_offset)
+                addl_med_tax_threshold = ADDL_MED_TAX_THRESHOLD * ((1 + ctx['infl'] / 100) ** year_offset)
+                for ei in [earned_income_me, earned_income_spouse]:
+                    if ei > 0:
+                        ss_tax = min(ei, ss_wage_base) * 0.062
+                        med_tax = ei * 0.0145
+                        addl_med_tax = max(0, ei - addl_med_tax_threshold) * 0.009
+                        fica_tax += ss_tax + med_tax + addl_med_tax
+
+                total_tax = base_fed_tax + state_tax + fica_tax
+                yd["Expense: Taxes"] = total_tax
+
+                # Medicare IRMAA Surcharges Proxy (uses pre_tax_ord UNADJUSTED by QBI, but correctly includes Conversions)
+                num_on_medicare = 0
+                if is_my_alive and my_current_age >= 65: num_on_medicare += 1
+                if is_spouse_alive and spouse_current_age >= 65: num_on_medicare += 1
+
+                magi_for_irmaa = pre_tax_ord  # IRS rules specify MAGI includes Roth conversions, but we add back QBI implicitly because pre_tax_ord didn't have QBI deducted
+
+                if num_on_medicare > 0:
+                    infl_factor = (1 + ctx['infl'] / 100) ** year_offset
+                    t1 = 206000 * infl_factor if active_mfj else 103000 * infl_factor
+                    t2 = 258000 * infl_factor if active_mfj else 129000 * infl_factor
+                    t3 = 322000 * infl_factor if active_mfj else 161000 * infl_factor
+                    t4 = 386000 * infl_factor if active_mfj else 193000 * infl_factor
+                    t5 = 750000 * infl_factor if active_mfj else 500000 * infl_factor
+
+                    surcharge = 0
+                    if magi_for_irmaa > t5:
+                        surcharge = 6500 * infl_factor
+                    elif magi_for_irmaa > t4:
+                        surcharge = 5500 * infl_factor
+                    elif magi_for_irmaa > t3:
+                        surcharge = 4000 * infl_factor
+                    elif magi_for_irmaa > t2:
+                        surcharge = 2500 * infl_factor
+                    elif magi_for_irmaa > t1:
+                        surcharge = 1000 * infl_factor
+
+                    total_irmaa = surcharge * num_on_medicare
+                    if total_irmaa > 0:
+                        total_exp += total_irmaa
+                        yd["Expense: Medicare IRMAA Surcharge"] = total_irmaa
+                        if not irmaa_triggered:
+                            if year not in milestones_by_year: milestones_by_year[year] = []
+                            milestones_by_year[year].append(
+                                {"desc": "📉 Medicare IRMAA Surcharge Triggered", "amt": total_irmaa, "type": "system"})
+                            irmaa_triggered = True
+
+                        # Trigger milestone if we jump tiers
+                        if total_irmaa > last_irmaa_tier + 500:
+                            if year not in milestones_by_year: milestones_by_year[year] = []
+                            milestones_by_year[year].append(
+                                {"desc": "📉 Medicare IRMAA Surcharge Tier Jumped", "amt": total_irmaa,
+                                 "type": "system"})
+                            last_irmaa_tier = total_irmaa
+
+                # 11. Employer Match Routing & Mid-Year Asset Growth
+                person_401k_contribs = {'Me': 0, 'Spouse': 0, 'Joint': 0}  # reset for actual loop processing
 
                 # Distribute matches specifically to 401k/HSA/Roth first
                 for acct_type_target in ['Traditional 401(k)', 'Roth 401(k)', 'HSA']:
@@ -1616,21 +1761,18 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     is_owner_alive = is_my_alive if owner in ['Me', 'Joint'] else is_spouse_alive
 
                     added_this_year = 0
-                    if is_owner_alive and not is_retired:
+                    if is_owner_alive:
                         stop_contrib = a.get('stop_at_ret', True)
                         if not (stop_contrib and year >= owner_retire_year):
                             added_this_year = a['contrib']
 
-                            # Soft cap IRS Limits
                             if a.get('Type') in ['Traditional 401(k)', 'Roth 401(k)']:
                                 limit = plan_401k_limit + (catchup_401k if owner_age >= 50 else 0)
-                                added_this_year = min(added_this_year, limit)
+                                added_this_year = min(added_this_year, max(0, limit - person_401k_contribs[owner]))
+                                person_401k_contribs[owner] += added_this_year
                             elif a.get('Type') in ['Traditional IRA', 'Roth IRA']:
-                                limit = (IRA_LIMIT_BASE * ((1 + ctx['infl'] / 100) ** year_offset)) + (
-                                    CATCHUP_IRA_BASE if owner_age >= 50 else 0)
+                                limit = ira_limit + (catchup_ira if owner_age >= 50 else 0)
                                 added_this_year = min(added_this_year, limit)
-
-                            user_out_of_pocket_contribs += added_this_year
 
                     match_to_add = a.get('match_contrib_queue', 0)
                     a['match_contrib_queue'] = 0
@@ -1640,62 +1782,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     a['bal'] *= (1 + a_growth / 100)
                     a['bal'] += (added_this_year * 0.5) + (match_to_add * 0.5)
 
-                # 9. Finalize Taxes
-                base_fed_tax, marginal_rate = calc_federal_tax(tax_base_ord, active_mfj, year_offset, ctx['infl'])
-                state_tax = tax_base_ord * (state_tax_rate / 100.0)
-
-                # FICA Tax (Indexed for inflation to prevent bracket creep in 30yr models)
-                fica_tax = 0
-                ss_wage_base = SS_WAGE_BASE_2026 * ((1 + ctx['infl'] / 100) ** year_offset)
-                addl_med_tax_threshold = ADDL_MED_TAX_THRESHOLD * ((1 + ctx['infl'] / 100) ** year_offset)
-                for ei in [earned_income_me, earned_income_spouse]:
-                    if ei > 0:
-                        ss_tax = min(ei, ss_wage_base) * 0.062
-                        med_tax = ei * 0.0145
-                        addl_med_tax = max(0, ei - addl_med_tax_threshold) * 0.009
-                        fica_tax += ss_tax + med_tax + addl_med_tax
-
-                total_tax = base_fed_tax + state_tax + fica_tax
-                yd["Expense: Taxes"] = total_tax
-
-                # Medicare IRMAA Surcharges Proxy (uses pre_tax_ord unadjusted by conversions, but shielded by QBI logic inside if)
-                num_on_medicare = 0
-                if is_my_alive and my_current_age >= 65: num_on_medicare += 1
-                if is_spouse_alive and spouse_current_age >= 65: num_on_medicare += 1
-
-                magi_for_irmaa = pre_tax_ord - total_converted
-
-                if num_on_medicare > 0:
-                    infl_factor = (1 + ctx['infl'] / 100) ** year_offset
-                    t1 = 206000 * infl_factor if active_mfj else 103000 * infl_factor
-                    t2 = 258000 * infl_factor if active_mfj else 129000 * infl_factor
-                    t3 = 322000 * infl_factor if active_mfj else 161000 * infl_factor
-                    t4 = 386000 * infl_factor if active_mfj else 193000 * infl_factor
-                    t5 = 750000 * infl_factor if active_mfj else 500000 * infl_factor
-
-                    surcharge = 0
-                    if magi_for_irmaa > t5:
-                        surcharge = 6500 * infl_factor
-                    elif magi_for_irmaa > t4:
-                        surcharge = 5500 * infl_factor
-                    elif magi_for_irmaa > t3:
-                        surcharge = 4000 * infl_factor
-                    elif magi_for_irmaa > t2:
-                        surcharge = 2500 * infl_factor
-                    elif magi_for_irmaa > t1:
-                        surcharge = 1000 * infl_factor
-
-                    total_irmaa = surcharge * num_on_medicare
-                    if total_irmaa > 0:
-                        total_exp += total_irmaa
-                        yd["Expense: Medicare IRMAA Surcharge"] = total_irmaa
-                        if not irmaa_triggered:
-                            if year not in milestones_by_year: milestones_by_year[year] = []
-                            milestones_by_year[year].append(
-                                {"desc": "📉 Medicare IRMAA Surcharge Triggered", "amt": total_irmaa, "type": "system"})
-                            irmaa_triggered = True
-
-                # 10. Robust Shortfall / Withdrawal Math
+                # 12. Robust Shortfall / Withdrawal Math
                 if user_out_of_pocket_contribs > 0:
                     yd["Expense: Portfolio Contributions"] = user_out_of_pocket_contribs
 
@@ -1704,7 +1791,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 yd["Net Savings"] = net_cash_flow
 
                 if net_cash_flow > 0:
-                    yd["Expense: Unallocated Surplus Saved"] = net_cash_flow
+                    yd["Cashflow: Surplus Reinvested"] = net_cash_flow
                     # Surplus Handling & RMD Reinvestment
                     if unfunded_debt_bal > 0:
                         payoff = min(net_cash_flow, unfunded_debt_bal)
@@ -1724,10 +1811,76 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 elif net_cash_flow < 0:
                     shortfall = abs(net_cash_flow)
 
+                    def _withdraw(a, current_shortfall, tax_treatment):
+                        nonlocal tapped_brokerage, tapped_trad, tapped_roth, total_tax
+                        if a['bal'] <= 0: return current_shortfall
+
+                        eff_tax = 0.0
+                        req_gross = current_shortfall
+
+                        if tax_treatment == 'cg':
+                            if not tapped_brokerage:
+                                if year not in milestones_by_year: milestones_by_year[year] = []
+                                milestones_by_year[year].append(
+                                    {"desc": "📉 Began Drawing from Taxable Brokerage", "amt": 0, "type": "system"})
+                                tapped_brokerage = True
+                            is_step_up = ctx['has_spouse'] and (not is_my_alive or not is_spouse_alive)
+                            eff_tax = 0.0 if is_step_up else (
+                                        get_ltcg_rate(tax_base_ord, active_mfj, year_offset, ctx['infl']) + (
+                                            state_tax_rate / 100.0))
+                            req_gross = current_shortfall / max(0.01, (1.0 - eff_tax))
+
+                        elif tax_treatment == 'ordinary':
+                            if not tapped_trad:
+                                if year not in milestones_by_year: milestones_by_year[year] = []
+                                milestones_by_year[year].append(
+                                    {"desc": "📉 Began Drawing from Traditional 401(k)/IRA", "amt": 0, "type": "system"})
+                                tapped_trad = True
+                            owner_acct = a.get('Owner', 'Me')
+                            owner_age_acct = my_current_age if owner_acct in ['Me', 'Joint'] else spouse_current_age
+                            owner_retire_age_acct = ctx['primary_retire_year'] - ctx['my_birth_year'] if owner_acct in [
+                                'Me', 'Joint'] else ctx['spouse_retire_year'] - ctx['spouse_birth_year']
+                            rule_of_55 = (owner_retire_age_acct >= 55 and owner_age_acct >= owner_retire_age_acct)
+                            penalty = 0.10 if (owner_age_acct < 59.5 and not rule_of_55) else 0.0
+                            eff_tax = min(marginal_rate + (state_tax_rate / 100.0) + penalty, 0.99)
+                            req_gross = current_shortfall / max(0.01, (1.0 - eff_tax))
+
+                        elif tax_treatment == 'free':
+                            if not tapped_roth:
+                                if year not in milestones_by_year: milestones_by_year[year] = []
+                                milestones_by_year[year].append(
+                                    {"desc": "📉 Began Drawing from Roth/Tax-Free Assets", "amt": 0, "type": "system"})
+                                tapped_roth = True
+                            owner_acct = a.get('Owner', 'Me')
+                            owner_age_acct = my_current_age if owner_acct in ['Me', 'Joint'] else spouse_current_age
+                            owner_retire_age_acct = ctx['primary_retire_year'] - ctx['my_birth_year'] if owner_acct in [
+                                'Me', 'Joint'] else ctx['spouse_retire_year'] - ctx['spouse_birth_year']
+                            rule_of_55 = (owner_retire_age_acct >= 55 and owner_age_acct >= owner_retire_age_acct)
+                            penalty = 0.10 if (a.get('Type') in ['Roth 401(k)',
+                                                                 'Roth IRA'] and owner_age_acct < 59.5 and not rule_of_55) else 0.0
+                            eff_tax = min(penalty, 0.99)
+                            req_gross = current_shortfall / max(0.01, (1.0 - eff_tax))
+
+                        if a['bal'] >= req_gross:
+                            a['bal'] -= req_gross
+                            tax_inc = req_gross - current_shortfall
+                            total_tax += tax_inc
+                            yd["Expense: Taxes"] = yd.get("Expense: Taxes", 0) + tax_inc
+                            yd[f"Income: Withdrawal ({a.get('Account Name', 'Account')})"] = req_gross
+                            return 0
+                        else:
+                            withdrawn = a['bal']
+                            a['bal'] = 0
+                            tax_inc = withdrawn * eff_tax
+                            net_cash = withdrawn - tax_inc
+                            total_tax += tax_inc
+                            yd["Expense: Taxes"] = yd.get("Expense: Taxes", 0) + tax_inc
+                            yd[f"Income: Withdrawal ({a.get('Account Name', 'Account')})"] = withdrawn
+                            return current_shortfall - net_cash
+
                     # --- Sequence 1a: Checking/Savings/HYSA (0% Tax) ---
                     cash_was_available = any(a['bal'] > 0 for a in sim_assets if
                                              a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash'])
-
                     for a in sim_assets:
                         if shortfall <= 0: break
                         if a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash']:
@@ -1752,198 +1905,38 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                                  "type": "system"})
                             cash_depleted = True
 
-                    # --- Sequence 1b: Taxable Brokerage (Taxed at Capital Gains proxy) ---
+                    # --- Sequence 1b: Taxable Brokerage ---
                     if shortfall > 0:
                         for a in sim_assets:
                             if shortfall <= 0: break
-                            if a.get('Type') == 'Brokerage (Taxable)' and a['bal'] > 0:
-                                if not tapped_brokerage:
-                                    if year not in milestones_by_year: milestones_by_year[year] = []
-                                    milestones_by_year[year].append(
-                                        {"desc": "📉 Began Drawing from Taxable Brokerage", "amt": 0, "type": "system"})
-                                    tapped_brokerage = True
+                            if a.get('Type') == 'Brokerage (Taxable)':
+                                shortfall = _withdraw(a, shortfall, 'cg')
 
-                                is_step_up = ctx['has_spouse'] and (not is_my_alive or not is_spouse_alive)
-                                eff_tax = 0.0 if is_step_up else (
-                                            get_ltcg_rate(tax_base_ord, active_mfj, year_offset, ctx['infl']) + (
-                                                state_tax_rate / 100.0))
-                                req_gross = shortfall / max(0.01, (1.0 - eff_tax))
-
-                                if a['bal'] >= req_gross:
-                                    a['bal'] -= req_gross
-                                    tax_inc = req_gross - shortfall
-                                    yd["Expense: Taxes"] += tax_inc
-                                    yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = req_gross
-                                    shortfall = 0
-                                else:
-                                    withdrawn = a['bal']
-                                    a['bal'] = 0
-                                    tax_inc = withdrawn * eff_tax
-                                    net_cash = withdrawn - tax_inc
-                                    yd["Expense: Taxes"] += tax_inc
-                                    yd[f"Income: Withdrawal ({a.get('Account Name', 'Brokerage')})"] = withdrawn
-                                    shortfall -= net_cash
-
-                    # Select logic based on Withdrawal Strategy
+                    # --- Sequence 2 & 3: Order depends on Strategy ---
                     if 'Standard' in ctx['active_withdrawal_strategy']:
-                        # --- Sequence 2: Tax-Deferred (Traditional 401k) ---
                         if shortfall > 0:
                             for a in sim_assets:
                                 if shortfall <= 0: break
-                                if a.get('Type') in ['Traditional 401(k)', 'Traditional IRA'] and a['bal'] > 0:
-                                    if not tapped_trad:
-                                        if year not in milestones_by_year: milestones_by_year[year] = []
-                                        milestones_by_year[year].append(
-                                            {"desc": "📉 Began Drawing from Traditional 401(k)/IRA", "amt": 0,
-                                             "type": "system"})
-                                        tapped_trad = True
-
-                                    owner = a.get('Owner', 'Me')
-                                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
-                                    owner_retire_age = ctx['primary_retire_year'] - ctx['my_birth_year'] if owner in [
-                                        'Me', 'Joint'] else ctx['spouse_retire_year'] - ctx['spouse_birth_year']
-
-                                    # Rule of 55: Penalty waived if retiring at 55 or later AND reaching that age
-                                    rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
-                                    penalty = 0.10 if (owner_age < 59.5 and not rule_of_55) else 0.0
-
-                                    eff_tax = min(marginal_rate + (state_tax_rate / 100.0) + penalty, 0.99)
-                                    req_gross = shortfall / (1.0 - eff_tax)
-
-                                    if a['bal'] >= req_gross:
-                                        a['bal'] -= req_gross
-                                        tax_inc = req_gross - shortfall
-                                        yd["Expense: Taxes"] += tax_inc
-                                        yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = req_gross
-                                        shortfall = 0
-                                    else:
-                                        withdrawn = a['bal']
-                                        a['bal'] = 0
-                                        tax_inc = withdrawn * eff_tax
-                                        net_cash = withdrawn - tax_inc
-                                        yd["Expense: Taxes"] += tax_inc
-                                        yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = withdrawn
-                                        shortfall -= net_cash
-
-                        # --- Sequence 3: Tax-Free (Roth/HSA) ---
+                                if a.get('Type') in ['Traditional 401(k)', 'Traditional IRA']: shortfall = _withdraw(a,
+                                                                                                                     shortfall,
+                                                                                                                     'ordinary')
                         if shortfall > 0:
                             for a in sim_assets:
                                 if shortfall <= 0: break
                                 if a.get('Type') in ['Roth 401(k)', 'Roth IRA', 'HSA', 'Crypto', '529 Plan',
-                                                     'Other'] and a['bal'] > 0:
-                                    if not tapped_roth:
-                                        if year not in milestones_by_year: milestones_by_year[year] = []
-                                        milestones_by_year[year].append(
-                                            {"desc": "📉 Began Drawing from Roth/Tax-Free Assets", "amt": 0,
-                                             "type": "system"})
-                                        tapped_roth = True
-
-                                    owner = a.get('Owner', 'Me')
-                                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
-                                    owner_retire_age = ctx['primary_retire_year'] - ctx['my_birth_year'] if owner in [
-                                        'Me', 'Joint'] else ctx['spouse_retire_year'] - ctx['spouse_birth_year']
-
-                                    rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
-                                    penalty = 0.10 if (a.get(
-                                        'Type') == 'Roth 401(k)' and owner_age < 59.5 and not rule_of_55) else 0.0
-
-                                    eff_tax = min(penalty, 0.99)
-                                    req_gross = shortfall / max(0.01, (1.0 - eff_tax))
-
-                                    if a['bal'] >= req_gross:
-                                        a['bal'] -= req_gross
-                                        tax_inc = req_gross - shortfall
-                                        yd["Expense: Taxes"] += tax_inc
-                                        yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = req_gross
-                                        shortfall = 0
-                                    else:
-                                        withdrawn = a['bal']
-                                        a['bal'] = 0
-                                        tax_inc = withdrawn * eff_tax
-                                        net_cash = withdrawn - tax_inc
-                                        yd["Expense: Taxes"] += tax_inc
-                                        yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = withdrawn
-                                        shortfall -= net_cash
-
+                                                     'Other']: shortfall = _withdraw(a, shortfall, 'free')
                     else:
-                        # --- ROTH PREFERRED STRATEGY ---
-                        # --- Sequence 2: Tax-Free (Roth/HSA) ---
                         if shortfall > 0:
                             for a in sim_assets:
                                 if shortfall <= 0: break
                                 if a.get('Type') in ['Roth 401(k)', 'Roth IRA', 'HSA', 'Crypto', '529 Plan',
-                                                     'Other'] and a['bal'] > 0:
-                                    if not tapped_roth:
-                                        if year not in milestones_by_year: milestones_by_year[year] = []
-                                        milestones_by_year[year].append(
-                                            {"desc": "📉 Began Drawing from Roth/Tax-Free Assets", "amt": 0,
-                                             "type": "system"})
-                                        tapped_roth = True
-
-                                    owner = a.get('Owner', 'Me')
-                                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
-                                    owner_retire_age = ctx['primary_retire_year'] - ctx['my_birth_year'] if owner in [
-                                        'Me', 'Joint'] else ctx['spouse_retire_year'] - ctx['spouse_birth_year']
-
-                                    rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
-                                    penalty = 0.10 if (a.get(
-                                        'Type') == 'Roth 401(k)' and owner_age < 59.5 and not rule_of_55) else 0.0
-
-                                    eff_tax = min(penalty, 0.99)
-                                    req_gross = shortfall / max(0.01, (1.0 - eff_tax))
-
-                                    if a['bal'] >= req_gross:
-                                        a['bal'] -= req_gross
-                                        tax_inc = req_gross - shortfall
-                                        yd["Expense: Taxes"] += tax_inc
-                                        yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = req_gross
-                                        shortfall = 0
-                                    else:
-                                        withdrawn = a['bal']
-                                        a['bal'] = 0
-                                        tax_inc = withdrawn * eff_tax
-                                        net_cash = withdrawn - tax_inc
-                                        yd["Expense: Taxes"] += tax_inc
-                                        yd[f"Income: Withdrawal ({a.get('Account Name', 'Roth')})"] = withdrawn
-                                        shortfall -= net_cash
-
-                        # --- Sequence 3: Tax-Deferred (Traditional 401k) ---
+                                                     'Other']: shortfall = _withdraw(a, shortfall, 'free')
                         if shortfall > 0:
                             for a in sim_assets:
                                 if shortfall <= 0: break
-                                if a.get('Type') in ['Traditional 401(k)', 'Traditional IRA'] and a['bal'] > 0:
-                                    if not tapped_trad:
-                                        if year not in milestones_by_year: milestones_by_year[year] = []
-                                        milestones_by_year[year].append(
-                                            {"desc": "📉 Began Drawing from Traditional 401(k)/IRA", "amt": 0,
-                                             "type": "system"})
-                                        tapped_trad = True
-
-                                    owner = a.get('Owner', 'Me')
-                                    owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
-                                    owner_retire_age = ctx['primary_retire_year'] - ctx['my_birth_year'] if owner in [
-                                        'Me', 'Joint'] else ctx['spouse_retire_year'] - ctx['spouse_birth_year']
-
-                                    rule_of_55 = (owner_retire_age >= 55 and owner_age >= owner_retire_age)
-                                    penalty = 0.10 if (owner_age < 59.5 and not rule_of_55) else 0.0
-
-                                    eff_tax = min(marginal_rate + (state_tax_rate / 100.0) + penalty, 0.99)
-                                    req_gross = shortfall / (1.0 - eff_tax)
-
-                                    if a['bal'] >= req_gross:
-                                        a['bal'] -= req_gross
-                                        tax_inc = req_gross - shortfall
-                                        yd["Expense: Taxes"] += tax_inc
-                                        yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = req_gross
-                                        shortfall = 0
-                                    else:
-                                        withdrawn = a['bal']
-                                        a['bal'] = 0
-                                        tax_inc = withdrawn * eff_tax
-                                        net_cash = withdrawn - tax_inc
-                                        yd["Expense: Taxes"] += tax_inc
-                                        yd[f"Income: Withdrawal ({a.get('Account Name', '401k')})"] = withdrawn
-                                        shortfall -= net_cash
+                                if a.get('Type') in ['Traditional 401(k)', 'Traditional IRA']: shortfall = _withdraw(a,
+                                                                                                                     shortfall,
+                                                                                                                     'ordinary')
 
                     # --- Sequence 4: Complete Liquidity Failure -> Shortfall Debt ---
                     if shortfall > 0:
@@ -1983,7 +1976,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
                 sim_res.append({"Year": year, "Age (Primary)": my_current_age, "Age (Spouse)": spouse_current_age,
                                 "Annual Income": annual_inc, "Annual Expenses": total_exp,
-                                "Annual Taxes": yd["Expense: Taxes"], "Annual Net Savings": yd["Net Savings"],
+                                "Annual Taxes": yd.get("Expense: Taxes", 0), "Annual Net Savings": yd["Net Savings"],
                                 "Liquid Assets": liquid_assets_total,
                                 "Real Estate Equity": re_equity, "Business Equity": cur_biz_val,
                                 "Debt": -debt_bal_total, "Unfunded Debt": unfunded_debt_bal, "Net Worth": net_worth})
@@ -1994,7 +1987,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
 
         @st.cache_data(show_spinner=False)
-        def run_cached_simulation(mkt_sequence_tuple, ctx_str):
+        def run_cached_simulation(mkt_sequence_tuple, ctx_str, _email):
             ctx = json.loads(ctx_str)
             mkt_sequence = list(mkt_sequence_tuple)
             s_res, d_res, nw_res, milestones = run_simulation(mkt_sequence, ctx)
@@ -2003,10 +1996,13 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
         # --- EXECUTE BASE DETERMINISTIC RUN ---
         deterministic_seq = tuple([mkt] * (max_years + 1))
-        ctx_json_str = json.dumps(sim_ctx)
+        ctx_json_str = json.dumps(sim_ctx, sort_keys=True)
 
         df_sim_nominal, df_det_nominal, df_nw_nominal, run_milestones = run_cached_simulation(deterministic_seq,
-                                                                                              ctx_json_str)
+                                                                                              ctx_json_str,
+                                                                                              st.session_state.get(
+                                                                                                  'user_email',
+                                                                                                  'guest'))
 
         # --- UI RENDER: DASHBOARD ---
         if not df_sim_nominal.empty:
@@ -2203,11 +2199,11 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     inflows = {k.replace('Income: ', ''): v for k, v in row.items() if
                                k.startswith('Income:') and v > 0 and k != 'Income: Shortfall Debt Funded'}
                     outflows = {k.replace('Expense: ', ''): v for k, v in row.items() if
-                                k.startswith('Expense:') and v > 0}
+                                k.startswith('Expense:') and v > 0 and k not in ['Expense: Unallocated Surplus Saved']}
 
                     net_savings = row.get('Net Savings', 0)
                     if net_savings > 0:
-                        outflows['Net Savings & Investments'] = net_savings
+                        outflows['Cashflow: Surplus Reinvested'] = net_savings
                     elif net_savings < 0:
                         inflows['Shortfall Debt Funded'] = abs(net_savings)
 
@@ -2241,10 +2237,10 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                         source.append(middle_idx)
                         target.append(middle_idx + 1 + i)
                         value.append(v)
-                        node_colors.append(
-                            '#10b981' if k in ['Portfolio Contributions', 'Unallocated Surplus Saved'] else '#f43f5e')
+                        node_colors.append('#10b981' if k in ['Portfolio Contributions',
+                                                              'Cashflow: Surplus Reinvested'] else '#f43f5e')
                         link_colors.append('rgba(16, 185, 129, 0.4)' if k in ['Portfolio Contributions',
-                                                                              'Unallocated Surplus Saved'] else 'rgba(244, 63, 94, 0.4)')
+                                                                              'Cashflow: Surplus Reinvested'] else 'rgba(244, 63, 94, 0.4)')
 
                     fig_sankey = go.Figure(data=[go.Sankey(
                         arrangement="snap",
@@ -2356,7 +2352,8 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
             t1, t2 = st.tabs(["Income & Expense Log", "Net Worth Log"])
             with t1:
                 st.subheader("Detailed Tax & Expense Log")
-                inc_c = sorted([c for c in df_det.columns if c.startswith("Income:") or c.startswith("Roth")])
+                inc_c = sorted([c for c in df_det.columns if
+                                c.startswith("Income:") or c.startswith("Roth") or c.startswith("Cashflow:")])
                 exp_c = sorted([c for c in df_det.columns if c.startswith("Expense:")])
                 ord_det = ["Year", "Age (Primary)", "Age (Spouse)"] + inc_c + exp_c + ["Net Savings"]
                 st.dataframe(df_det[ord_det].set_index("Year").style.format(
@@ -2670,14 +2667,20 @@ if st.button("🚀 Save Full Profile to Cloud Server", type="primary", width="st
         def clean(df, k):
             if not isinstance(df, pd.DataFrame): return df
             if df.empty: return []
-            rows = df[df[k].astype(str) != ""].to_dict('records')
-            for r in rows:
+            valid_rows = []
+            for r in df.to_dict('records'):
+                clean_r = {}
                 for vk, vv in r.items():
                     try:
-                        if pd.isna(vv): r[vk] = None
+                        if pd.isna(vv) or vv is pd.NA:
+                            clean_r[vk] = None
+                        else:
+                            clean_r[vk] = vv
                     except (TypeError, ValueError):
-                        pass
-            return rows
+                        clean_r[vk] = vv
+                if any(str(v).strip() for v in clean_r.values() if v is not None):
+                    valid_rows.append(clean_r)
+            return valid_rows
 
 
         user_data = {
