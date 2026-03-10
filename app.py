@@ -647,15 +647,14 @@ with st.expander("💸 4. Lifetime Cash Flows (Budgets & Milestones)", expanded=
             if c.get("Description"):
                 migrated.append({"Description": c.get("Description"), "Category": c.get("Category", "Other"),
                                  "Frequency": c.get("Frequency", "Monthly"), "Amount ($)": c.get("Amount ($)", 0),
-                                 "Start Phase": "Now", "Start Year": current_year, "End Phase": "At Retirement",
-                                 "End Year": current_year + 50, "AI Estimate?": c.get("AI Estimate?", False)})
+                                 "Start Phase": "Now", "Start Year": None, "End Phase": "At Retirement",
+                                 "End Year": None, "AI Estimate?": c.get("AI Estimate?", False)})
         for r in ud.get('retire_expenses', []):
             if r.get("Description"):
                 migrated.append({"Description": r.get("Description"), "Category": r.get("Category", "Other"),
                                  "Frequency": r.get("Frequency", "Monthly"), "Amount ($)": r.get("Amount ($)", 0),
-                                 "Start Phase": "At Retirement", "Start Year": current_year + 20,
-                                 "End Phase": "End of Life", "End Year": current_year + 50,
-                                 "AI Estimate?": r.get("AI Estimate?", False)})
+                                 "Start Phase": "At Retirement", "Start Year": None, "End Phase": "End of Life",
+                                 "End Year": None, "AI Estimate?": r.get("AI Estimate?", False)})
         for m in ud.get('one_time_events', []):
             if m.get("Description"):
                 try:
@@ -673,11 +672,18 @@ with st.expander("💸 4. Lifetime Cash Flows (Budgets & Milestones)", expanded=
 
         if not migrated:
             migrated = [{"Description": "Groceries", "Category": "Food", "Frequency": "Monthly", "Amount ($)": 0,
-                         "Start Phase": "Now", "Start Year": current_year, "End Phase": "End of Life",
-                         "End Year": current_year + 50, "AI Estimate?": False}]
+                         "Start Phase": "Now", "Start Year": None, "End Phase": "End of Life", "End Year": None,
+                         "AI Estimate?": False}]
         st.session_state['lifetime_expenses'] = migrated
 
     df_exp = pd.DataFrame(st.session_state['lifetime_expenses'])
+
+    # Force clean nulls for non-custom phases to keep UI clean
+    if not df_exp.empty:
+        if 'Start Phase' in df_exp.columns and 'Start Year' in df_exp.columns:
+            df_exp.loc[df_exp['Start Phase'] != 'Custom Year', 'Start Year'] = None
+        if 'End Phase' in df_exp.columns and 'End Year' in df_exp.columns:
+            df_exp.loc[df_exp['End Phase'] != 'Custom Year', 'End Year'] = None
 
     edited_exp = st.data_editor(
         df_exp,
@@ -708,7 +714,7 @@ with st.expander("💸 4. Lifetime Cash Flows (Budgets & Milestones)", expanded=
                 locked_desc = [x['Description'] for x in locked]
                 wealth_ctx = f"The household has a current annual pre-tax income of ${curr_inc_total:,.0f} and liquid assets totaling ${liq_ast_total:,.0f}. VERY IMPORTANT: While you should scale the budget to reflect this wealth, assume these users are savvy spenders and aggressive savers (comfortable but smart with money), so avoid over-inflating lifestyle costs unnecessarily."
                 allowed_cats = ", ".join(budget_categories)
-                prompt = f"Current City: {curr_city_flow}. Planned Retirement City: {ret_city_flow}. Family: {k_ctx}. Current Year is {current_year}. {wealth_ctx} Generate a comprehensive list of missing living expenses AND expected future life milestones (like college or weddings). {ai_exclusion} CRITICAL INSTRUCTIONS: 1) Medical expenses (IRMAA, Medicare Cliff, Pre-Medicare gap, LTC) are handled automatically by the simulation engine; only provide modest baseline out-of-pocket healthcare costs. 2) Model 'Empty Nesting': phase out child-heavy groceries, utility expenses, and ANY K-12 extracurriculars/lessons using 'Custom Year' End Phases exactly when the youngest child turns 18. 3) ALL College/University expenses MUST be categorized strictly as 'Education' (not 'Other') so they receive the 5% education inflation penalty. NOTE: Start and End Years are INCLUSIVE. For a standard 4-year college, the End Year must be exactly 3 years after the Start Year (e.g., Start 2032, End 2035 is 4 years). 4) Model Retirement Lifestyle Phases: split travel and entertainment into 'Go-Go Years' (high spend, starts at retirement, lasts 10 years, calculate costs based on {ret_city_flow}), 'Slow-Go Years' (medium spend, lasts next 10 years), and 'No-Go Years' (low spend) using 'Custom Year' Start/End phases. 5) STRICT PHASE SHIFTING: Never overlap the same living expense category. If an expense changes at retirement, the 'Now' version MUST have 'End Phase' set to 'At Retirement', and the new version MUST have 'Start Phase' set to 'At Retirement'. If an expense continues unchanged forever, set it to 'Now' until 'End of Life'. Skip these items as they are already accounted for: {json.dumps(locked_desc)}. Return ONLY a JSON array of objects with keys: 'Description', 'Category' (MUST be exactly one of: {allowed_cats}. If unsure, default to 'Other'), 'Frequency' (Monthly/Yearly/One-Time), 'Amount ($)' (number), 'Start Phase' (Now/At Retirement/Custom Year), 'Start Year' (integer), 'End Phase' (End of Life/At Retirement/Custom Year), 'End Year' (integer), and 'AI Estimate?' (true)."
+                prompt = f"Current City: {curr_city_flow}. Planned Retirement City: {ret_city_flow}. Family: {k_ctx}. Current Year is {current_year}. {wealth_ctx} Generate a comprehensive list of missing living expenses AND expected future life milestones (like college or weddings). {ai_exclusion} CRITICAL INSTRUCTIONS: 1) Medical expenses (IRMAA, Medicare Cliff, Pre-Medicare gap, LTC) are handled automatically by the simulation engine; only provide modest baseline out-of-pocket healthcare costs. 2) Model 'Empty Nesting': phase out child-heavy groceries, utility expenses, and ANY K-12 extracurriculars/lessons using 'Custom Year' End Phases exactly when the youngest child turns 18. 3) ALL College/University expenses MUST be categorized strictly as 'Education' (not 'Other') so they receive the 5% education inflation penalty. NOTE: Start and End Years are INCLUSIVE. For a standard 4-year college, the End Year must be exactly 3 years after the Start Year (e.g., Start 2032, End 2035 is 4 years). 4) Model Retirement Lifestyle Phases: split travel and entertainment into 'Go-Go Years' (high spend, starts at retirement, lasts 10 years, calculate costs based on {ret_city_flow}), 'Slow-Go Years' (medium spend, lasts next 10 years), and 'No-Go Years' (low spend) using 'Custom Year' Start/End phases. 5) STRICT PHASE SHIFTING: Never overlap the same living expense category. If an expense changes at retirement, the 'Now' version MUST have 'End Phase' set to 'At Retirement', and the new version MUST have 'Start Phase' set to 'At Retirement'. If an expense continues unchanged forever, set it to 'Now' until 'End of Life'. Skip these items as they are already accounted for: {json.dumps(locked_desc)}. Return ONLY a JSON array of objects with keys: 'Description', 'Category' (MUST be exactly one of: {allowed_cats}. If unsure, default to 'Other'), 'Frequency' (Monthly/Yearly/One-Time), 'Amount ($)' (number), 'Start Phase' (Now/At Retirement/Custom Year), 'Start Year' (integer, ONLY if 'Start Phase' is 'Custom Year', otherwise null), 'End Phase' (End of Life/At Retirement/Custom Year), 'End Year' (integer, ONLY if 'End Phase' is 'Custom Year', otherwise null), and 'AI Estimate?' (true)."
                 res = call_gemini_json(prompt)
                 if res and isinstance(res, list) and len(res) > 0:
                     st.session_state['lifetime_expenses'] = locked + res
@@ -2124,56 +2130,117 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     {c: "${:,.0f}" for c in ord_nw if c not in ["Age (Primary)", "Age (Spouse)", "Year"]} | {
                         "Age (Primary)": "{:.0f}", "Age (Spouse)": "{:.0f}"}), width="stretch")
 
-# --- AI FIDUCIARY REPORT (BOTTOM ANCHORED) ---
-st.markdown("---")
-st.markdown("### 🤖 AI Fiduciary Health Report")
-st.markdown(
-    '<div class="info-text">💡 This engine extracts a 5-year interval timeseries snapshot of your entire financial life (Age, Net Worth, Liquid Cash, Income, Expenses, and Taxes). The AI acts as a fiduciary and analyzes your cash flows chronologically to provide tactical, phase-by-phase advice on Roth conversions, sequence of returns, and tax optimization.</div>',
-    unsafe_allow_html=True)
-c_ai_rep, _ = st.columns([1, 2])
-with c_ai_rep:
-    st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
-    if st.button("✨ Generate Comprehensive AI Report", width="stretch"):
-        with st.spinner("AI extracting timeseries data and acting as fiduciary advisor..."):
-            if 'sim_results' in locals() and len(sim_results) > 0:
-                sim_summary = {
-                    "Current Age": my_age, "Retirement Age": ret_age, "Life Expectancy": my_life_exp_val,
-                    "Current Net Worth": df_sim_nominal.iloc[0]['Net Worth'],
-                    "Final Net Worth": df_sim_nominal.iloc[-1]['Net Worth'],
-                    "Shortfall Year": str(deplete_year) if deplete_year is not None else "None"
-                }
+# --- 10. AI FIDUCIARY REPORT & WHAT-IF SIMULATOR ---
+with st.expander("🤖 10. AI Fiduciary Health & What-If Simulator", expanded=False):
+    st.markdown(
+        '<div class="info-text">💡 This engine extracts a 5-year interval timeseries snapshot of your entire financial life. The AI acts as a fiduciary and analyzes your cash flows chronologically to provide tactical advice and run hypothetical scenarios.</div>',
+        unsafe_allow_html=True)
 
-                # Compress 50 years of data into 5-year leaps so the AI can digest the timeline without context limits
-                timeline_summary = []
-                for idx, row in df_sim_nominal.iloc[::5].iterrows():
-                    timeline_summary.append({
-                        "Age": int(row["Age"]),
-                        "Income": int(row["Annual Income"]),
-                        "Expenses": int(row["Annual Expenses"]),
-                        "Taxes": int(row["Annual Taxes"]),
-                        "Liquid_Assets": int(row["Liquid Assets"]),
-                        "Net_Worth": int(row["Net Worth"])
-                    })
-                # Always append the final year
-                last_row = df_sim_nominal.iloc[-1]
-                timeline_summary.append({"Age": int(last_row["Age"]), "Income": int(last_row["Annual Income"]),
-                                         "Expenses": int(last_row["Annual Expenses"]),
-                                         "Taxes": int(last_row["Annual Taxes"]),
-                                         "Liquid_Assets": int(last_row["Liquid Assets"]),
-                                         "Net_Worth": int(last_row["Net Worth"])})
+    tab_report, tab_whatif = st.tabs(["📊 Comprehensive Health Report", "🔮 What-If Simulator"])
 
-                prompt = f"Act as an expert fiduciary financial planner. Review this user's summary: {json.dumps(sim_summary)} and their chronological 5-year cash flow progression: {json.dumps(timeline_summary)}. Provide a highly detailed, year-by-year or phase-by-phase tactical analysis. Focus on specific strategies they can use to optimize their tax buckets (e.g., when exactly to execute Roth conversions before RMDs begin), sequence of withdrawals, and managing the gaps between retirement and Social Security/Medicare. Return ONLY valid JSON exactly like this: {{\"analysis\": \"your detailed markdown text here, using \\n for line breaks\"}}"
-                res = call_gemini_json(prompt)
-                if res and 'analysis' in res:
-                    st.session_state['ai_analysis_report'] = res['analysis']
-                else:
-                    st.error("⚠️ AI Analysis failed to generate.")
+    # Store standard data extraction here so both tabs can securely access it
+    if 'sim_results' in locals() and len(sim_results) > 0:
+        sim_summary = {
+            "Current Age": my_age, "Retirement Age": ret_age, "Life Expectancy": my_life_exp_val,
+            "Current Net Worth": df_sim_nominal.iloc[0]['Net Worth'],
+            "Final Net Worth": df_sim_nominal.iloc[-1]['Net Worth'],
+            "Shortfall Year": str(deplete_year) if deplete_year is not None else "None"
+        }
+
+        # Compress 50 years of data into 5-year leaps so the AI can digest the timeline without context limits
+        timeline_summary = []
+        for idx, row in df_sim_nominal.iloc[::5].iterrows():
+            timeline_summary.append({
+                "Age": int(row["Age"]),
+                "Income": int(row["Annual Income"]),
+                "Expenses": int(row["Annual Expenses"]),
+                "Taxes": int(row["Annual Taxes"]),
+                "Liquid_Assets": int(row["Liquid Assets"]),
+                "Net_Worth": int(row["Net Worth"])
+            })
+        # Always append the final year
+        last_row = df_sim_nominal.iloc[-1]
+        timeline_summary.append({"Age": int(last_row["Age"]), "Income": int(last_row["Annual Income"]),
+                                 "Expenses": int(last_row["Annual Expenses"]), "Taxes": int(last_row["Annual Taxes"]),
+                                 "Liquid_Assets": int(last_row["Liquid Assets"]),
+                                 "Net_Worth": int(last_row["Net Worth"])})
+    else:
+        sim_summary = {}
+        timeline_summary = []
+
+    with tab_report:
+        st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
+        if st.button("✨ Generate Comprehensive AI Report", width="stretch", key="btn_report"):
+            if sim_summary:
+                with st.spinner("AI extracting timeseries data and acting as fiduciary advisor..."):
+                    prompt = f"Act as an expert fiduciary financial planner. Review this user's summary: {json.dumps(sim_summary)} and their chronological 5-year cash flow progression: {json.dumps(timeline_summary)}. Provide a highly detailed, year-by-year or phase-by-phase tactical analysis. Focus on specific strategies they can use to optimize their tax buckets (e.g., when exactly to execute Roth conversions before RMDs begin), sequence of withdrawals, and managing the gaps between retirement and Social Security/Medicare. Return ONLY valid JSON exactly like this: {{\"analysis\": \"your detailed markdown text here, using \\n for line breaks\"}}"
+                    res = call_gemini_json(prompt)
+                    if res and 'analysis' in res:
+                        st.session_state['ai_analysis_report'] = res['analysis']
+                    else:
+                        st.error("⚠️ AI Analysis failed to generate.")
             else:
-                st.warning("Please run the simulation first.")
+                st.warning("Please run the baseline simulation first.")
 
-if 'ai_analysis_report' in st.session_state:
-    report_content = st.session_state['ai_analysis_report'].replace('\\n', '\n').replace('$', r'\$')
-    st.info(f"{report_content}")
+        if 'ai_analysis_report' in st.session_state:
+            st.info(st.session_state['ai_analysis_report'].replace('\\n', '\n').replace('$', r'\$'))
+
+    with tab_whatif:
+        what_if_query = st.text_area(
+            "Ask the AI to simulate a scenario (e.g., 'What if I sold my rental property in 2030 and put the cash in my brokerage?' or 'What if I added $50k in income starting in 2029?')",
+            key="what_if_text")
+
+        st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
+        if st.button("✨ Run What-If Analysis (AI)", width="stretch", key="btn_whatif"):
+            if sim_summary and what_if_query:
+                with st.spinner("AI processing alternative timelines and computing what-if scenario..."):
+                    prompt = f"Act as an expert fiduciary financial planner. Review this user's baseline simulation summary: {json.dumps(sim_summary)} and their chronological 5-year cash flow progression: {json.dumps(timeline_summary)}. The user wants to run the following 'what-if' scenario: '{what_if_query}'. Analyze how this change would mathematically and strategically impact their net worth, cash flow, and tax strategy compared to the baseline. Provide a highly detailed, reasonable estimate and tactical breakdown of this scenario. Return ONLY valid JSON exactly like this: {{\"analysis\": \"your detailed markdown text here, using \\n for line breaks\"}}"
+                    res = call_gemini_json(prompt)
+                    if res and 'analysis' in res:
+                        st.session_state['what_if_analysis_report'] = res['analysis']
+                    else:
+                        st.error("⚠️ AI Analysis failed to generate.")
+            elif not what_if_query:
+                st.warning("Please enter a scenario to simulate.")
+            else:
+                st.warning("Please run the baseline simulation first.")
+
+        if 'what_if_analysis_report' in st.session_state:
+            st.success(st.session_state['what_if_analysis_report'].replace('\\n', '\n').replace('$', r'\$'))
+
+# --- 11. FAQ SECTION ---
+with st.expander("📖 11. How the Engine Works (FAQ)", expanded=False):
+    st.markdown("""
+    **Q: How does the simulation handle my employer 401(k) match?**
+    **A:** The engine separates your paycheck contributions from your employer's "free money." It removes the match from your spendable cash flow (so it doesn't falsely inflate your living expenses), but it mirrors the total combined amount to your assets so your balances grow correctly.
+
+    **Q: Are my investment properties inflating my cash flow charts?**
+    **A:** No. Investment properties are treated in an isolated "Investment Bubble." The engine calculates the gross rent minus the exact mortgage (P&I) and upkeep. Only the *Net Profit* or *Net Loss* spills over into your primary cash flow charts. Your primary residence, however, acts as a standard living expense.
+
+    **Q: What happens if my W-2 income exceeds my expenses and savings goals?**
+    **A:** The "Surplus Waterfall" automatically catches all unspent money. If you have "Shortfall Debt," it pays that down first. Next, it sweeps the remaining surplus into your Taxable Brokerage. If you don't have one, it flows into your HYSA/Savings. This ensures every penny works for you and compounds with market growth.
+
+    **Q: How do 529 Plans interact with college costs?**
+    **A:** The engine uses fuzzy-matching to connect your 529 Asset names (e.g., "Sarahna 529") with your milestone expenses (e.g., "Sarahna College"). It subtracts the tuition from the 529 balance and logs an offsetting tax-free withdrawal so your net cash flow isn't penalized until the 529 is empty.
+
+    **Q: What happens to RMDs if a spouse passes away?**
+    **A:** Required Minimum Distributions (RMDs) pause for the deceased spouse's specific accounts, allowing them to continue growing tax-deferred. The surviving spouse can still draw down from those accounts seamlessly if the simulation requires cash to cover a shortfall.
+
+    **Q: How are Federal Taxes calculated? Do you just use a flat rate?**
+    **A:** No, the engine uses progressive 2026 IRS tax brackets. It dynamically calculates your Standard Deduction (adjusting for Single vs. Married Filing Jointly) and inflates the tax brackets every year based on your CPI assumption to prevent "bracket creep." It also separates ordinary income (W-2, RMDs, Rent) from Capital Gains (Brokerage withdrawals) for accurate tax treatment.
+
+    **Q: What is the "Pre-Medicare Gap Proxy"?**
+    **A:** If you retire before age 65, you lose employer-sponsored healthcare but don't yet qualify for Medicare. The engine automatically injects a $15,000/year (adjusted for healthcare inflation) private insurance expense for each year between your retirement age and 65 to protect you from underestimating early retirement costs.
+
+    **Q: What is the Medicare IRMAA Surcharge?**
+    **A:** Medicare Part B & D premiums are income-based. If your taxable income (including RMDs, Roth Conversions, and business income) crosses certain IRS thresholds during retirement, the engine automatically calculates and applies the IRMAA penalty surcharge to your healthcare expenses.
+
+    **Q: How does the "Roth Conversion Optimizer" work?**
+    **A:** If enabled, the engine looks at your taxable income during your early retirement years (before RMDs and Social Security begin). It calculates exactly how much "room" you have left in your selected tax bracket (e.g., the 24% bracket). It then converts Traditional 401(k) funds to a Roth IRA to fill that space, explicitly checking if you have enough liquid cash in your savings/brokerage to pay the tax bill without going into debt.
+
+    **Q: How does the Monte Carlo risk analysis work?**
+    **A:** Real markets don't return exactly 7% every year. The Monte Carlo engine runs your exact financial profile through 100+ parallel realities, randomly varying the stock market return each year based on historical volatility (Standard Deviation). It then reports your Probability of Success—the percentage of simulations where your net worth stays above $0 until your life expectancy.
+    """)
 
 # --- FINAL SAVE CORE ---
 st.markdown("---")
