@@ -4,6 +4,7 @@ import requests
 import json
 import datetime
 import time
+import copy
 import random
 from dateutil.relativedelta import relativedelta
 import warnings
@@ -86,6 +87,24 @@ st.markdown("""
     div[data-testid="stElementContainer"]:has(.ai-btn-marker) + div[data-testid="stElementContainer"] button:hover {
         transform: translateY(-2px);
         box-shadow: 0 6px 20px 0 rgba(79, 70, 229, 0.39) !important;
+    }
+
+    /* Save Button subtle styling */
+    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button,
+    div[data-testid="stElementContainer"]:has(.save-btn-marker) + div[data-testid="stElementContainer"] button {
+        background-color: #f0fdf4 !important;
+        border: 1px solid #bbf7d0 !important;
+        color: #166534 !important;
+        font-weight: 600 !important;
+        border-radius: 8px !important;
+        transition: all 0.2s ease !important;
+    }
+    div[data-testid="element-container"]:has(.save-btn-marker) + div[data-testid="element-container"] button:hover,
+    div[data-testid="stElementContainer"]:has(.save-btn-marker) + div[data-testid="stElementContainer"] button:hover {
+        background-color: #dcfce7 !important;
+        border-color: #86efac !important;
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(22, 101, 52, 0.15) !important;
     }
 
     /* Main Action Button (Bottom Save) */
@@ -370,7 +389,8 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
         '<div class="info-text">💡 <strong>Employer Match Note:</strong> Employer 401(k) matches are considered part of your total compensation, but are <strong>not</strong> spendable cash income. Professionally, you should list the match here for visibility. The engine will intelligently auto-deposit it into your assets so your balances grow correctly.</div>',
         unsafe_allow_html=True)
 
-    df_inc = pd.DataFrame(ud.get('income', []))
+    # Preemptively fetch session state edits to prevent wiping un-saved manual inputs on AI rerun
+    df_inc = pd.DataFrame(st.session_state.get('income', ud.get('income', [])))
     if df_inc.empty:
         df_inc = pd.DataFrame(
             [{"Description": "Base Salary", "Category": "Base Salary (W-2)", "Owner": "Me", "Annual Amount ($)": 0,
@@ -435,6 +455,7 @@ with st.expander("💵 2. Your Income Streams", expanded=False):
                              "Start Year": spouse_birth_year + 67, "End Year": 2100, "Stop at Ret.?": False,
                              "Override Growth (%)": None})
                     st.session_state['user_data']['income'] = current_inc
+                    st.session_state['income'] = current_inc
                     st.rerun()
 
 # --- 3. ASSETS, LIABILITIES & NET WORTH ---
@@ -924,8 +945,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 else:
                     return 1.0 - (36 * (5 / 9 * 0.01)) - ((months_early - 36) * (5 / 12 * 0.01))
             elif r_age > fra:
-                months_late = min((r_age - fra) * 12,
-                                  36)  # Cap delayed retirement credits at age 70 (36 months after FRA 67)
+                months_late = min((r_age - fra) * 12, (70 - fra) * 12)  # Strict cap at age 70
                 return 1.0 + (months_late * (2 / 3 * 0.01))
             return 1.0
 
@@ -959,11 +979,14 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
         inc_records = edited_inc.to_dict('records')
         exp_records = edited_exp.to_dict('records')
         ast_records = edited_ast.to_dict('records')
-        debt_records = edited_debt.to_dict('records')
+
+        # Filter purely empty debt records to prevent zero-balances continuously entering amortization logic
+        debt_records = [d for d in edited_debt.to_dict('records') if
+                        d.get("Debt Name") and safe_num(d.get("Current Balance ($)")) > 0]
         re_records = edited_re.to_dict('records')
         biz_records = edited_biz.to_dict('records')
 
-        # Package environment context to entirely decouple the simulation loop
+        # Package environment context to entirely decouple the simulation loop for ThreadPoolExecutor
         sim_ctx = {
             'current_year': current_year, 'my_birth_year': my_birth_year, 'spouse_birth_year': spouse_birth_year,
             'primary_end_year': primary_end_year, 'spouse_end_year': spouse_end_year, 'has_spouse': has_spouse,
@@ -1035,6 +1058,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
             prev_debt_bals = {d['name']: d['bal'] for d in sim_debts}
             prev_re_debts = {r['name']: r['debt'] for r in sim_re}
             prev_ast_bals = {a['Account Name']: a['bal'] for a in sim_assets}
+            prev_unfunded_debt_bal = 0
 
             for year_offset in range(ctx['max_years'] + 1):
                 year = ctx['current_year'] + year_offset
@@ -1047,11 +1071,9 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 if not is_my_alive and not is_spouse_alive:
                     break
 
-                # 1. Unfunded Debt Accrues Interest (Prior year balance compounds first)
-                if unfunded_debt_bal > 0:
-                    unfunded_debt_bal *= 1.18
+                # 1. Base Setup & Milestones
+                prev_unfunded_debt_bal = unfunded_debt_bal
 
-                # 2. Base Setup & Milestones
                 if ctx['has_spouse'] and not is_spouse_alive and not spouse_died_notified:
                     if year not in milestones_by_year: milestones_by_year[year] = []
                     milestones_by_year[year].append(
@@ -1089,7 +1111,6 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     milestones_by_year[year].append({"desc": "🏦 Spouse RMDs Begin", "amt": 0, "type": "system"})
 
                 is_retired = year >= ctx['primary_retire_year']
-                is_spouse_retired = ctx['has_spouse'] and (year >= ctx['spouse_retire_year'])
 
                 yd = {"Year": year, "Age (Primary)": my_current_age, "Age (Spouse)": spouse_current_age}
                 nw_yd = {"Year": year, "Age (Primary)": my_current_age, "Age (Spouse)": spouse_current_age}
@@ -1098,7 +1119,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 earned_income_me, earned_income_spouse = 0, 0
                 match_income_by_owner = {"Me": 0, "Spouse": 0, "Joint": 0}
 
-                # 3. Market Returns (Stress Test vs Glidepath)
+                # 2. Market Returns (Stress Test vs Glidepath)
                 base_mkt_yr = mkt_sequence[year_offset]
                 if ctx['stress_test'] and year == ctx['primary_retire_year']:
                     mkt_glide = -25.0
@@ -1113,7 +1134,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
                 active_mfj = True if ctx['has_spouse'] and is_my_alive and is_spouse_alive else False
 
-                # 4. RMDs (Calculated strictly on Prior Year Dec 31st Balance before any growth or contribs)
+                # 3. RMDs (Calculated strictly on Prior Year Dec 31st Balance before any growth or contribs)
                 rmd_income = 0
                 for a in sim_assets:
                     if a.get('Type') in ['Traditional 401(k)', 'Traditional IRA'] and a['bal'] > 0:
@@ -1133,7 +1154,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     annual_inc += rmd_income
                     yd["Income: RMDs"] = rmd_income
 
-                # 5. Income Generation
+                # 4. Income Generation
                 primary_ss_amt = 0
                 spouse_ss_amt = 0
 
@@ -1161,9 +1182,9 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                         offset_for_growth = max(0, year - ctx['current_year'])
 
                         if cat_name == "Social Security":
-                            # SS multiplier applies once, then it grows via inflation COLA
-                            amt = base_amt * (ctx['my_ss_multi'] if owner == "Me" else ctx['spouse_ss_multi']) * (
-                                        (1 + ctx['infl'] / 100) ** offset_for_growth)
+                            # SS multiplier applied ONCE to base, then grown via COLA
+                            adjusted_base = base_amt * (ctx['my_ss_multi'] if owner == "Me" else ctx['spouse_ss_multi'])
+                            amt = adjusted_base * ((1 + ctx['infl'] / 100) ** offset_for_growth)
                             if owner == "Me":
                                 primary_ss_amt = amt
                             elif owner == "Spouse":
@@ -1236,7 +1257,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                             taxable_ss = min(0.85 * active_ss, 0.85 * (ss_provisional_income - 34000) + tier1_max)
                     pre_tax_ord += taxable_ss
 
-                # 6. Business & Real Estate
+                # 5. Business & Real Estate
                 cur_biz_val, re_equity = 0, 0
                 total_exp = 0  # Initialize general expenses
                 biz_income_total = 0
@@ -1251,6 +1272,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     yd["Income: Biz Dist"] = yd.get("Income: Biz Dist", 0) + b['dist']
 
                 # Phase-out compliant QBI Deduction Proxy
+                qbi_deduction = 0
                 if biz_income_total > 0:
                     infl_factor = (1 + ctx['infl'] / 100) ** year_offset
                     qbi_threshold = (383900 if active_mfj else 191950) * infl_factor
@@ -1263,8 +1285,6 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                         qbi_deduction = biz_income_total * 0.20 * ratio
                     else:
                         qbi_deduction = 0
-
-                    pre_tax_ord -= qbi_deduction  # Decrease ordinary income by deduction
 
                 for r in sim_re:
                     if year_offset > 0:
@@ -1319,7 +1339,10 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     taxable_rent = max(0, r['rent'] - r['exp'] - interest_paid)
                     pre_tax_ord += taxable_rent
 
-                # 7. Roth Conversion Optimizer (Executes before mid-year growth)
+                # Tax Base Ord protects QBI deduction without mutating the actual pre_tax_ord (needed for IRMAA)
+                tax_base_ord = max(0, pre_tax_ord - qbi_deduction)
+
+                # 6. Roth Conversion Optimizer (Executes before mid-year growth)
                 state_tax_rate = ctx['cur_t'] if not is_retired else ctx['ret_t']
                 total_converted = 0
                 if ctx['roth_conversions'] and is_retired:
@@ -1333,16 +1356,20 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     target_limit = b_limits.get(ctx['roth_target'], 383900) * infl_factor
                     target_max_income = target_limit + std_deduction
 
-                    conversion_room = max(0, target_max_income - pre_tax_ord)
+                    conversion_room = max(0, target_max_income - tax_base_ord)
 
                     # GUARDRAIL: Only convert what can be comfortably paid by existing liquid cash
-                    base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, active_mfj, year_offset, ctx['infl'])
+                    base_fed_tax, marginal_rate = calc_federal_tax(tax_base_ord + conversion_room, active_mfj,
+                                                                   year_offset, ctx['infl'])
                     est_tax_rate = marginal_rate + (state_tax_rate / 100.0)
 
                     available_cash = sum(a['bal'] for a in sim_assets if
                                          a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)',
                                                            'Unallocated Cash'])
-                    max_tax_budget = available_cash * 0.50
+
+                    # Compute safe conversion buffer by deducting known living expenses
+                    safe_liquid_cash = max(0, available_cash - total_exp)
+                    max_tax_budget = safe_liquid_cash * 0.95  # Safe 5% margin
                     max_conversion_by_cash = max_tax_budget / max(0.10, est_tax_rate)
 
                     conversion_room = min(conversion_room, max_conversion_by_cash)
@@ -1377,12 +1404,13 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
                         if total_converted > 0:
                             pre_tax_ord += total_converted
+                            tax_base_ord += total_converted
                             yd["Roth Conversion Amount"] = total_converted
                             # The resulting tax liability is inherently captured by the year-end
                             # "total_tax" calculation, which dynamically expands the shortfall
                             # waterfall to successfully draw the tax from cash reserves verified above.
 
-                # 8. Unified Lifetime Cash Flows Engine
+                # 7. Unified Lifetime Cash Flows Engine
                 for ev in ctx['exp_records']:
                     desc = str(ev.get("Description", "")).strip()
                     if not desc: continue
@@ -1421,13 +1449,15 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                             ctx['infl_ed'] if cat == "Education" else ctx['infl'])
                         inflated_amt = amt * ((1 + cat_infl / 100) ** year_offset)
 
-                        # Drop recurring lifestyle expenses if widow(er)
+                        # Drop recurring lifestyle expenses if widow(er) -> Applies to lifestyle only
                         if ctx['has_spouse'] and not (
                                 is_my_alive and is_spouse_alive) and freq != "One-Time" and cat not in ["Education",
                                                                                                         "Debt Payments",
                                                                                                         "Healthcare",
-                                                                                                        "Insurance"]:
-                            inflated_amt *= 0.6
+                                                                                                        "Insurance",
+                                                                                                        "Housing / Rent"]:
+                            if is_retired:
+                                inflated_amt *= 0.6
 
                         # Medicare Cliff logic (Applies to both spouses)
                         primary_on_medicare = is_my_alive and my_current_age >= 65
@@ -1458,11 +1488,11 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                                     target_kid = k['name'].lower()
                                     break
 
-                            # Pass 1: Strict Kid Name Match
+                            # Pass 1: Strict Kid Name Match (Regex boundaries prevent substrings)
                             if target_kid:
                                 for a in sim_assets:
-                                    if a.get('Type') == '529 Plan' and a['bal'] > 0 and target_kid in str(
-                                            a.get('Account Name', '')).lower():
+                                    if a.get('Type') == '529 Plan' and a['bal'] > 0 and re.search(
+                                            rf'\b{re.escape(target_kid)}\b', str(a.get('Account Name', '')).lower()):
                                         if a['bal'] >= amount_to_cover:
                                             a['bal'] -= amount_to_cover
                                             covered_by_529 += amount_to_cover
@@ -1500,12 +1530,17 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     yd["Expense: Healthcare (Pre-Medicare Gap Proxy)"] = gap_cost
 
                 # LTC Shock
-                if ctx['ltc_shock'] and my_current_age >= (ctx['my_life_exp_val'] - 2) and is_my_alive:
-                    ltc_cost = LTC_SHOCK_COST * ((1 + ctx['infl_hc'] / 100) ** year_offset)
-                    total_exp += ltc_cost
-                    yd["Expense: Long Term Care Shock"] = ltc_cost
+                if ctx['ltc_shock']:
+                    if is_my_alive and my_current_age >= (ctx['my_life_exp_val'] - 2):
+                        ltc_cost = LTC_SHOCK_COST * ((1 + ctx['infl_hc'] / 100) ** year_offset)
+                        total_exp += ltc_cost
+                        yd["Expense: Long Term Care Shock (Primary)"] = ltc_cost
+                    if ctx['has_spouse'] and is_spouse_alive and spouse_current_age >= (ctx['spouse_life_exp_val'] - 2):
+                        ltc_cost_spouse = LTC_SHOCK_COST * ((1 + ctx['infl_hc'] / 100) ** year_offset)
+                        total_exp += ltc_cost_spouse
+                        yd["Expense: Long Term Care Shock (Spouse)"] = ltc_cost_spouse
 
-                # Debt Amortization
+                # Debt Amortization (Generic Liabilities)
                 debt_bal_total = 0
                 for d in sim_debts:
                     monthly_rate = d['rate'] / 12
@@ -1522,23 +1557,21 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     total_exp += actual_paid
                     yd["Expense: Debt Payments"] = yd.get("Expense: Debt Payments", 0) + actual_paid
 
-                    # Trigger Debt Payoff Milestone
                     if d['bal'] <= 0 and prev_debt_bals.get(d['name'], 0) > 0:
                         if year not in milestones_by_year: milestones_by_year[year] = []
                         milestones_by_year[year].append(
                             {"desc": f"🎉 Debt Paid Off: {d['name']}", "amt": 0, "type": "system"})
                     prev_debt_bals[d['name']] = d['bal']
-
                     debt_bal_total += d['bal']
 
-                # 9. Asset Contributions & Market Growth (Mid-Year Convention)
+                # 8. Asset Contributions & Market Growth (Mid-Year Convention)
                 user_out_of_pocket_contribs = 0
 
                 # IRA / 401k Limit Tracker
                 plan_401k_limit = PLAN_401K_LIMIT_BASE * ((1 + ctx['infl'] / 100) ** year_offset)
                 catchup_401k = CATCHUP_401K_BASE * ((1 + ctx['infl'] / 100) ** year_offset)
 
-                # Distribute matches specifically to 401k first
+                # Distribute matches specifically to 401k/HSA/Roth first
                 for acct_type_target in ['Traditional 401(k)', 'Roth 401(k)', 'HSA']:
                     for a in sim_assets:
                         if a.get('Type') == acct_type_target:
@@ -1547,6 +1580,21 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                             if match_avail > 0:
                                 a['match_contrib_queue'] = match_avail
                                 match_income_by_owner[owner] = 0
+
+                # Fallback: If no 401k exists, don't delete the employer match, route it to brokerage/cash
+                for owner, match_left in match_income_by_owner.items():
+                    if match_left > 0:
+                        found_fallback = False
+                        for a in sim_assets:
+                            if a.get('Owner') == owner and a.get('Type') in ['Brokerage (Taxable)', 'HYSA',
+                                                                             'Checking/Savings']:
+                                a['match_contrib_queue'] = a.get('match_contrib_queue', 0) + match_left
+                                found_fallback = True
+                                break
+                        if not found_fallback and len(sim_assets) > 0:
+                            sim_assets[0]['match_contrib_queue'] = sim_assets[0].get('match_contrib_queue',
+                                                                                     0) + match_left
+                        match_income_by_owner[owner] = 0
 
                 for a in sim_assets:
                     custom_g = a.get('growth')
@@ -1592,9 +1640,9 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     a['bal'] *= (1 + a_growth / 100)
                     a['bal'] += (added_this_year * 0.5) + (match_to_add * 0.5)
 
-                # 10. Finalize Taxes
-                base_fed_tax, marginal_rate = calc_federal_tax(pre_tax_ord, active_mfj, year_offset, ctx['infl'])
-                state_tax = pre_tax_ord * (state_tax_rate / 100.0)
+                # 9. Finalize Taxes
+                base_fed_tax, marginal_rate = calc_federal_tax(tax_base_ord, active_mfj, year_offset, ctx['infl'])
+                state_tax = tax_base_ord * (state_tax_rate / 100.0)
 
                 # FICA Tax (Indexed for inflation to prevent bracket creep in 30yr models)
                 fica_tax = 0
@@ -1610,7 +1658,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                 total_tax = base_fed_tax + state_tax + fica_tax
                 yd["Expense: Taxes"] = total_tax
 
-                # Medicare IRMAA Surcharges Proxy
+                # Medicare IRMAA Surcharges Proxy (uses pre_tax_ord unadjusted by conversions, but shielded by QBI logic inside if)
                 num_on_medicare = 0
                 if is_my_alive and my_current_age >= 65: num_on_medicare += 1
                 if is_spouse_alive and spouse_current_age >= 65: num_on_medicare += 1
@@ -1647,7 +1695,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                                 {"desc": "📉 Medicare IRMAA Surcharge Triggered", "amt": total_irmaa, "type": "system"})
                             irmaa_triggered = True
 
-                # 11. Robust Shortfall / Withdrawal Math
+                # 10. Robust Shortfall / Withdrawal Math
                 if user_out_of_pocket_contribs > 0:
                     yd["Expense: Portfolio Contributions"] = user_out_of_pocket_contribs
 
@@ -1717,7 +1765,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
                                 is_step_up = ctx['has_spouse'] and (not is_my_alive or not is_spouse_alive)
                                 eff_tax = 0.0 if is_step_up else (
-                                            get_ltcg_rate(pre_tax_ord, active_mfj, year_offset, ctx['infl']) + (
+                                            get_ltcg_rate(tax_base_ord, active_mfj, year_offset, ctx['infl']) + (
                                                 state_tax_rate / 100.0))
                                 req_gross = shortfall / max(0.01, (1.0 - eff_tax))
 
@@ -1908,7 +1956,6 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     milestones_by_year[year].append(
                         {"desc": "🚨 MAJOR SHORTFALL: Retirement Accounts Depleted!", "amt": unfunded_debt_bal,
                          "type": "critical"})
-                prev_unfunded_debt_bal = unfunded_debt_bal
 
                 liquid_assets_total = 0
                 for a in sim_assets:
@@ -1986,7 +2033,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
             # APPLY DISCOUNTING IF TOGGLED (Vectorized execution for extreme performance)
             if view_todays_dollars:
-                discounts = (1 + infl / 100) ** df_sim.index
+                discounts = (1 + infl / 100) ** (df_sim['Year'] - current_year)
 
                 cols_sim = ["Annual Income", "Annual Expenses", "Annual Taxes", "Annual Net Savings", "Liquid Assets",
                             "Real Estate Equity", "Business Equity", "Debt", "Unfunded Debt", "Net Worth"]
@@ -2135,7 +2182,8 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
 
                 # --- SANKEY DIAGRAM ---
                 st.divider()
-                st.write("#### 🌊 Cash Flow Sankey Snapshot")
+                sankey_title = "#### 🌊 Cash Flow Sankey Snapshot" + (" (Today's $)" if view_todays_dollars else "")
+                st.write(sankey_title)
                 st.markdown(
                     '<div class="info-text">💡 <strong>Follow the Money:</strong> Select any year on the slider to see exactly where your money comes from and where it goes.</div>',
                     unsafe_allow_html=True)
@@ -2153,7 +2201,7 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                     row = df_det[df_det['Year'] == sankey_year].iloc[0]
 
                     inflows = {k.replace('Income: ', ''): v for k, v in row.items() if
-                               k.startswith('Income:') and v > 0}
+                               k.startswith('Income:') and v > 0 and k != 'Income: Shortfall Debt Funded'}
                     outflows = {k.replace('Expense: ', ''): v for k, v in row.items() if
                                 k.startswith('Expense:') and v > 0}
 
@@ -2244,22 +2292,27 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                                             range(mc_runs)]
 
                         # Execute deeply nested simulation via fast ThreadPool
-                        with ThreadPoolExecutor(max_workers=min(mc_runs, 8)) as executor:
-                            futures = [executor.submit(run_simulation, seq, sim_ctx) for seq in random_sequences]
+                        try:
+                            with ThreadPoolExecutor(max_workers=min(mc_runs, 8)) as executor:
+                                futures = [executor.submit(run_simulation, seq, copy.deepcopy(sim_ctx)) for seq in
+                                           random_sequences]
 
-                            for i, future in enumerate(futures):
-                                res, _, _, _ = future.result()
-                                nw_path = [step["Net Worth"] for step in res]
-                                all_nw_paths.append(nw_path)
+                                for i, future in enumerate(futures):
+                                    res, _, _, _ = future.result()
+                                    nw_path = [step["Net Worth"] for step in res]
+                                    all_nw_paths.append(nw_path)
 
-                                # A plan is successful if it finishes without carrying shortfall debt
-                                if res[-1].get("Unfunded Debt", 0) <= 0:
-                                    success_count += 1
+                                    # A plan is successful if it finishes without carrying shortfall debt
+                                    if res[-1].get("Unfunded Debt", 0) <= 0:
+                                        success_count += 1
 
-                                if i % max(1, mc_runs // 20) == 0:
-                                    mc_progress.progress((i + 1) / mc_runs)
+                                    if i % max(1, mc_runs // 20) == 0:
+                                        mc_progress.progress((i + 1) / mc_runs)
+                        except Exception as e:
+                            st.error(f"Simulation failed during multi-threading: {e}")
+                        finally:
+                            mc_progress.empty()
 
-                        mc_progress.empty()
                         success_rate = (success_count / mc_runs) * 100
 
                         path_len = len(all_nw_paths[0])
@@ -2402,37 +2455,209 @@ with st.expander("🤖 10. AI Fiduciary Health & What-If Simulator", expanded=Fa
             st.success(st.session_state['what_if_analysis_report'].replace('\\n', '\n').replace('$', r'\$'))
 
 # --- 11. FAQ SECTION ---
-with st.expander("📖 11. How the Engine Works (FAQ)", expanded=False):
+with st.expander("📖 11. Complete Beginner's Guide & FAQ", expanded=False):
     st.markdown("""
-    **Q: How does the simulation handle my employer 401(k) match?**
-    **A:** The engine completely separates your out-of-pocket paycheck contributions from your employer's "free money." It intelligently deducts ONLY your out-of-pocket contribution from your spendable cash flow, but it seamlessly routes the *combined total* (your contribution + employer match) directly into your 401(k) portfolio so your asset balances compound perfectly.
+    ### 🌟 GETTING STARTED
+    **Q: What exactly does this app do, and how is it different from a basic retirement calculator?**
+    **A:** Most retirement calculators ask you two questions — "how much do you have saved?" and "when do you want to retire?" — then spit out a single number. This app is fundamentally different. It builds a living, breathing financial model of your entire life — from today until the end of your life expectancy — and simulates every dollar coming in and going out, year by year.
+    It accounts for things a basic calculator completely ignores: your mortgage paying itself off over time, your kids going to college, your taxes changing when you retire, Social Security kicking in, Medicare starting at 65, your investment accounts being drawn down in the smartest possible tax order, and hundreds of other real-life events. The result isn't just a number — it's a full financial roadmap with warnings, milestones, and actionable advice.
 
-    **Q: Are my investment properties inflating my cash flow charts?**
-    **A:** No. Investment properties are mathematically shielded in an isolated "Investment Bubble." The engine calculates the gross rent minus the exact amortized mortgage (Principal & Interest) and upkeep. Only the resulting *Net Profit* or *Net Loss* spills over into your primary cash flow charts. Your primary residence, however, acts as a standard living expense.
+    **Q: Is this app a replacement for a financial advisor?**
+    **A:** No, and it's important to be honest about that. This app is an incredibly powerful planning and education tool — it helps you understand your own numbers, test scenarios, and have much smarter conversations with professionals. But it is not a licensed fiduciary advisor and cannot account for every personal circumstance, recent law change, or market condition. Think of it the way you'd think of WebMD: extremely useful for understanding what's happening with your health, but you still want a doctor making the final call on major decisions. Use this app to get clarity, then bring your printouts to a CPA or Certified Financial Planner (CFP) for personalized guidance.
 
-    **Q: What happens if my W-2 income exceeds my expenses and savings goals?**
-    **A:** The engine deploys a highly realistic "Surplus Waterfall" that automatically catches all unspent money. If you have any outstanding "Shortfall Debt," it aggressively pays that down first. Next, it sweeps the remaining surplus into your Taxable Brokerage. If you don't have one, it defaults into your HYSA or Checking. This ensures every single penny works for you and compounds with market growth instead of vanishing.
+    **Q: How accurate are these projections?**
+    **A:** The projections are as accurate as the information you put in, combined with the assumptions you choose. The simulation engine uses real IRS tax brackets, real Social Security claiming rules, and real Medicare cost structures. However, it cannot predict the future — no tool can. What it can do is show you the most mathematically likely outcomes based on historical data and your personal numbers. The Monte Carlo feature (explained later) is specifically designed to stress-test your plan against hundreds of unpredictable futures so you understand your real risk, not just the rosy average-case scenario.
 
-    **Q: How do 529 Plans interact with college costs?**
-    **A:** The engine uses targeted logic to connect your 529 Asset account names (e.g., "Sarahna 529") with your corresponding milestone expenses (e.g., "Sarahna College"). It subtracts the tuition invoice directly from the 529 balance and logs an offsetting tax-free withdrawal. Your net cash flow is completely shielded from the college bill until the 529 plan runs dry.
+    ### 👨‍👩‍👧‍👦 YOUR PROFILE & FAMILY
+    **Q: Why does the app need my exact date of birth instead of just my age?**
+    **A:** Because a few months can actually matter quite a bit in retirement planning. Your exact birth year determines three important things:
+    * **Your Social Security Full Retirement Age (FRA):** If you were born in 1960 or later, your FRA is 67. Born between 1955-1959, it's somewhere between 66 and 67. This is the age at which you receive your full Social Security benefit — claim earlier and you get permanently less, claim later and you get permanently more.
+    * **When your RMDs begin:** RMD stands for Required Minimum Distribution. The IRS forces you to start withdrawing money from your traditional retirement accounts at a certain age — either 73 or 75, depending on your birth year. Getting this wrong by even one year can create a surprise tax bill.
+    * **Your IRS Catch-Up Contribution eligibility:** Once you turn 50, you're allowed to contribute extra money to your 401(k) and IRA above the normal limits. The app needs your age to know when to apply this bonus.
 
-    **Q: What happens to RMDs if a spouse passes away?**
-    **A:** Required Minimum Distributions (RMDs) are legally bound to the living owner. The engine automatically halts RMDs for the deceased spouse's specific accounts, allowing those funds to continue growing tax-deferred. The surviving spouse can still seamlessly draw down from those inherited accounts if the simulation requires emergency cash to cover a shortfall.
+    **Q: What changes when I add a spouse?**
+    **A:** Quite a lot, actually. Adding a spouse unlocks a completely different set of tax rules that are generally more favorable:
+    * Married Filing Jointly (MFJ) tax brackets are roughly double the single brackets, meaning you pay a lower tax rate on the same income.
+    * Standard Deduction doubles from approximately $14,600 to $29,200.
+    * Social Security survivor benefits activate — if one spouse passes away, the surviving spouse automatically inherits the higher of the two Social Security benefit amounts.
+    * Retirement account strategies change — the app can now optimize withdrawals across two people's accounts.
+    * Lifestyle cost reduction — the simulation realistically models that a surviving spouse spends less (roughly 60% of the couple's former expenses) after the other passes.
 
-    **Q: How are Federal Taxes calculated? Do you just use a flat rate?**
-    **A:** No, the engine utilizes a fully functional progressive IRS tax calculator modeled on 2026 brackets. It dynamically calculates your Standard Deduction (adjusting for Single vs. Married Filing Jointly) and heavily inflates the tax brackets every year based on your CPI assumptions to prevent "bracket creep." It correctly separates Ordinary Income (W-2, RMDs, Rent) from Capital Gains (Brokerage withdrawals) to emulate a highly accurate tax environment.
+    **Q: What are "dependents" used for in the simulation?**
+    **A:** The app uses your children's ages to automatically time several important financial events. It models when child-related expenses (extracurricular activities, higher grocery bills, larger utility costs) naturally phase out as each child grows up and leaves home. It also uses their ages to calculate exactly when college tuition expenses should start and end in your cash flow. If you have a 529 college savings plan, the app connects it directly to your specific child's tuition costs, drawing down that account automatically when the bills arrive.
 
-    **Q: What is the "Pre-Medicare Gap Proxy"?**
-    **A:** If you retire before age 65, you instantly lose employer-sponsored healthcare but do not yet qualify for federal Medicare. To protect you from underestimating this massive expense, the engine automatically injects a $15,000/year (adjusted for healthcare inflation) private insurance penalty for each gap year. Crucially, if your passive income qualifies you for ACA subsidies, the engine scales the penalty down dynamically.
+    ### 💵 INCOME & SOCIAL SECURITY
+    **Q: What is an "employer 401(k) match" and why is it listed under income instead of savings?**
+    **A:** An employer match is essentially free money your company adds to your retirement account when you contribute your own money. For example, your employer might match 50 cents for every dollar you put in, up to 6% of your salary. It's listed under "Income" purely so the app can track it separately from your own contributions — this is important because employer match money goes directly into your 401(k) and is never spendable take-home cash. The app is careful to never count it as money you can spend on bills, but it does add it to your growing 401(k) balance behind the scenes so your retirement account grows accurately.
 
-    **Q: What is the Medicare IRMAA Surcharge?**
-    **A:** Medicare Part B & D premiums are highly income-based. If your taxable income (including RMDs, Roth Conversions, and business distributions) crosses certain IRS MAGI thresholds during retirement, the engine automatically calculates and applies the rigid IRMAA penalty surcharge to your total healthcare expenses.
+    **Q: What is Social Security, and how does the app calculate my benefit?**
+    **A:** Social Security is a federal retirement program you've been paying into your entire working life through payroll taxes (you'll see it labeled "FICA" on your pay stub). When you retire, you receive a monthly payment for life based on your 35 highest-earning years of work history. The app's AI can estimate your benefit based on your current age and income. The exact amount is also available on your personal Social Security statement at ssa.gov, which is always the most accurate source.
 
-    **Q: How does the "Roth Conversion Optimizer" work?**
-    **A:** If enabled, the engine evaluates your taxable income during your early retirement years (the "valley" before RMDs and Social Security begin). It calculates exactly how much "room" you have left before hitting the ceiling of your selected tax bracket. It then algorithmically converts Traditional 401(k) funds to a Roth IRA to fill that space, explicitly checking if you have enough liquid cash in your savings/brokerage to safely pay the resulting tax bill without triggering shortfall debt.
+    The critical decision the app helps you model is when to claim:
+    * Claim at 62 (earliest possible): Your benefit is permanently reduced by up to 30%.
+    * Claim at your Full Retirement Age (66-67): You receive 100% of your earned benefit.
+    * Claim at 70 (latest recommended): Your benefit is permanently increased by up to 24%.
 
-    **Q: How does the Monte Carlo risk analysis work?**
-    **A:** Real markets do not return a clean 7% every year. The Monte Carlo engine takes your completed financial blueprint and runs it through 100+ parallel realities. It mathematically scrambles your portfolio's annual return based on standard deviation (historical volatility). It then calculates your true "Probability of Success"—the percentage of alternate realities where your net worth survives the chaos until the day you die.
+    There is no single "right" answer — it depends on your health, other income sources, and whether you're married. The app lets you test different claiming ages to see the lifetime impact.
+
+    **Q: What does "taxable Social Security" mean? I thought Social Security wasn't taxed?**
+    **A:** This is one of the most surprising things people discover about retirement. Social Security can be taxed — up to 85% of your benefit can be added to your taxable income depending on how much other income you have. The IRS uses something called "Provisional Income" (basically your other income plus half your Social Security) to determine how much of your benefit is taxable. If your Provisional Income is low enough, your Social Security is completely tax-free. As your other income (from RMDs, investments, rent, etc.) rises, more of your Social Security becomes taxable. The app calculates this automatically every single year using the exact IRS formula — this is something most retirement calculators completely ignore, and it can represent tens of thousands of dollars in unexpected taxes.
+
+    **Q: What is a pension and how is it different from a 401(k)?**
+    **A:** A pension (sometimes called a "Defined Benefit" plan) is a retirement plan — common in government jobs, teaching, and some union jobs — where your employer guarantees you a specific monthly payment for life when you retire, regardless of what the stock market does. A 401(k) (called a "Defined Contribution" plan) is an account where you and your employer put money in and invest it, but the final amount you end up with depends entirely on how the market performed. Pensions are becoming increasingly rare in the private sector. If you have one, enter it as an income stream that starts at your retirement date.
+
+    ### 🏦 ASSETS, ACCOUNTS & INVESTING
+    **Q: What is the difference between all these account types? (401k, IRA, Roth, Brokerage...)**
+    **A:** This is one of the most important concepts to understand. All of these are just containers that hold your investments — the difference is purely about when the IRS taxes the money inside them:
+    * **Traditional 401(k) and Traditional IRA — "Pay taxes later":** You put money in before paying taxes (it reduces your taxable income today). Your money grows tax-free inside the account. When you withdraw it in retirement, you pay income taxes on every dollar you take out. The IRS forces you to start withdrawing at age 73 or 75 (called RMDs).
+    * **Roth 401(k) and Roth IRA — "Pay taxes now, never again":** You put money in after already paying taxes on it. Your money grows tax-free and you can withdraw it in retirement completely tax-free, with no RMDs ever required. This is generally better if you expect to be in a higher tax bracket in retirement than you are today.
+    * **Brokerage (Taxable) Account — "Pay taxes as you go":** A regular investment account with no special tax protection. You pay taxes on dividends and interest each year, and when you sell investments for a profit, you pay Capital Gains tax. However, there are no contribution limits and no restrictions on withdrawals. Also benefits from a special "step-up in basis" rule when you pass away (explained later).
+    * **HSA (Health Savings Account) — "Triple tax advantage":** If you have a high-deductible health insurance plan, an HSA is arguably the best account available. You contribute pre-tax, it grows tax-free, and withdrawals for medical expenses are tax-free. After age 65, you can withdraw for any reason (just pay income tax, like a Traditional IRA). Many financial planners call this a "stealth retirement account."
+    * **529 Plan — "Tax-free college savings":** Money invested in a 529 plan grows tax-free and can be withdrawn completely tax-free when used for qualified education expenses (tuition, room and board, books). The app automatically drains your 529 plans when college tuition expenses hit your cash flow timeline.
+
+    **Q: What are "RMDs" and why do they matter so much?**
+    **A:** RMD stands for Required Minimum Distribution. The IRS has a simple rule: you cannot keep money in a Traditional 401(k) or IRA forever. Starting at age 73 (or 75 if you were born in 1960 or later), you must withdraw a minimum amount every single year, whether you need the money or not. The amount is calculated by dividing your account balance by a life expectancy factor from an IRS table.
+
+    Why do they matter? Because every dollar you're forced to withdraw is added to your taxable income that year — which can push you into a higher tax bracket, cause more of your Social Security to become taxable, and trigger Medicare surcharges (IRMAA). People with large Traditional 401(k) balances can face an unexpected "tax time bomb" in their 70s. This is exactly why the Roth Conversion feature exists — to proactively move money out of your Traditional accounts in low-tax years before RMDs force the issue.
+
+    **Q: What are contribution limits? Why does the app warn me if I'm contributing too much?**
+    **A:** The IRS sets strict annual limits on how much you can contribute to retirement accounts. For 2026, these are approximately:
+    * 401(k): $23,500/year ($31,000 if you're 50 or older, thanks to "catch-up contributions")
+    * IRA: $7,000/year ($8,000 if you're 50 or older)
+
+    If you enter contributions above these limits, the app warns you because contributing over the limit triggers IRS penalties. The simulation automatically caps your contributions at the legal maximum so your projections remain realistic, even if you entered a higher number.
+
+    ### 🏡 REAL ESTATE & MORTGAGES
+    **Q: How does the app handle my mortgage?**
+    **A:** You simply enter three things: your current loan balance, your interest rate, and your monthly payment. The app then does something most calculators don't — it mathematically pays down your mortgage month by month, exactly as your bank would, separating out the interest and principal portions correctly. When the balance finally hits zero, the mortgage expense automatically disappears from your cash flow for every future year. You should NOT separately list your mortgage payment in the budget section — the app handles it entirely through your real estate entry.
+
+    **Q: What is "home equity" and how does it affect my net worth?**
+    **A:** Home equity is simply what you'd have left over if you sold your home and paid off the mortgage: Market Value minus Mortgage Balance. If your home is worth $400,000 and you owe $250,000, you have $150,000 in equity. As the years go by, your equity grows in two ways: your mortgage balance decreases as you make payments, and your home's market value (hopefully) increases with property appreciation. The app tracks both of these automatically and includes your home equity in your total net worth calculation.
+
+    **Q: What's the difference between a "primary residence" and an "investment property" in the app?**
+    **A:** The app treats these completely differently:
+    * **Your primary residence is where you live.** Its mortgage payment and monthly expenses (property taxes, insurance, HOA) flow out as living costs. Any rental income you happen to earn from it (like renting a room) flows in as income.
+    * **An investment property is treated as a business.** The app calculates the net cash flow — rent collected minus mortgage payment minus expenses — and only the net profit or loss affects your overall cash flow. If the property generates $2,000/month in rent but costs $1,800/month in mortgage and expenses, only the $200 net profit shows up in your income. This prevents investment properties from artificially inflating your apparent lifestyle income.
+
+    ### 💸 BUDGETS & EXPENSES
+    **Q: The expense table has "Start Phase" and "End Phase" — what do these mean?**
+    **A:** These control exactly when each expense is active in your lifetime simulation:
+    * "Now" means the expense starts today and continues until whatever end phase you choose.
+    * "At Retirement" means the expense either starts when you retire (like a new travel budget) or ends when you retire (like your work commute costs).
+    * "End of Life" means the expense continues until the very last year of your simulation.
+    * "Custom Year" lets you enter a specific year — useful for things like college tuition (starts in 2029, ends in 2032) or a car payment that ends in 2027.
+
+    A critical rule: if an expense changes at retirement (like your grocery bill going down slightly), you should create TWO rows — one that goes from "Now" to "At Retirement," and a separate one that goes from "At Retirement" to "End of Life" with the new amount. Do not try to make one row cover both phases.
+
+    **Q: Should I include my mortgage payment in the budget section?**
+    **A:** No. If you've entered your property in the Real Estate section with your mortgage balance and payment, the app already handles all of that math. Adding it again in the budget would double-count it and completely distort your cash flow projections. The same applies to any other debts you've entered in the Debts section — car loans, student loans, etc. entered there should NOT appear in the budget.
+
+    **Q: The AI generated a lot of expenses automatically. Should I trust them?**
+    **A:** The AI estimates are a solid starting point based on your city, family size, and income level — but you should always review and adjust them. Think of the AI as a well-informed assistant who has never actually lived your life. It might overestimate your dining out budget if you cook at home, or underestimate your travel budget if you're an avid traveler. The "🤖 AI?" checkbox column helps you quickly identify which rows were AI-generated versus ones you entered yourself. Always go through the list critically and adjust anything that doesn't match your actual lifestyle.
+
+    **Q: How does healthcare inflation work, and why is it different from regular inflation?**
+    **A:** Regular consumer inflation (food, clothing, electronics, etc.) has historically averaged around 2-3% per year. Healthcare costs, however, have consistently risen at 5-7% per year for decades — nearly double the overall inflation rate. This means a healthcare expense that costs $500/month today might cost over $1,300/month in 20 years if healthcare inflation continues at historical rates. The app applies a separate, higher inflation rate specifically to anything categorized as "Healthcare" or "Insurance" to capture this reality. This is one of the most important reasons not to underestimate your future healthcare costs.
+
+    ### 🏥 HEALTHCARE & MEDICARE
+    **Q: What is the "Pre-Medicare Gap" and why is it so expensive?**
+    **A:** If you retire before age 65, you face a potentially brutal financial gap. Most working Americans get health insurance through their employer — it's one of the most valuable parts of your compensation package, and your employer typically pays the majority of the premium. The moment you retire, that coverage ends. You're now on your own for health insurance until Medicare kicks in at age 65.
+
+    Buying private health insurance for a 60-year-old can easily cost $1,000-$2,000+ per month just in premiums, before copays and deductibles. This is called the "Pre-Medicare Gap" and it catches many early retirees completely off guard. The app automatically adds this cost to your simulation if you retire before 65, scaled to your income level (since lower-income retirees may qualify for ACA subsidies that reduce the cost).
+
+    **Q: What is Medicare? Is it free?**
+    **A:** Medicare is the federal health insurance program for Americans 65 and older. It is definitely not free, though it's generally much cheaper than private insurance. It has several parts:
+    * Part A (Hospital): Usually free if you've worked 10+ years.
+    * Part B (Doctor visits, outpatient): Costs approximately $185/month in 2026, automatically deducted from your Social Security check.
+    * Part D (Prescription drugs): Additional monthly premium, varies by plan.
+    * Medigap/Supplement: Optional private insurance to cover what Medicare doesn't.
+
+    The app models Medicare kicking in at age 65 and automatically reduces your healthcare budget at that point to reflect the generally lower costs compared to private insurance.
+
+    **Q: What is "IRMAA" and why might I have to pay extra for Medicare?**
+    **A:** IRMAA stands for Income-Related Monthly Adjustment Amount. It's essentially a Medicare "high earner surcharge." If your income in retirement exceeds certain thresholds (starting around $103,000/year for singles or $206,000/year for couples in 2026 dollars), the government charges you extra for your Medicare Part B and Part D premiums. The surcharges can be significant — anywhere from an extra $1,000 to $6,500+ per year.
+
+    Here's the sneaky part: the income the government uses to calculate IRMAA includes your RMDs, Social Security, investment income, and Roth conversions. So people who did everything "right" by accumulating large retirement accounts can end up triggering IRMAA surcharges they never anticipated. The app calculates and applies IRMAA automatically every year based on your projected income — which is a feature most retirement planning tools don't include at all.
+
+    **Q: What is "Long-Term Care" and why is it in the stress tests?**
+    **A:** Long-Term Care (LTC) refers to extended help with daily activities — bathing, dressing, eating, managing medications — typically needed in the final years of life due to illness, disability, or cognitive decline like dementia. This care is extremely expensive: a private nursing home room in the US costs $90,000-$120,000+ per year on average, and this is almost entirely NOT covered by regular Medicare.
+
+    The "LTC Shock" stress test injects a large medical expense into the final 2-3 years of your simulation to show what happens to your plan if you or a spouse needs this level of care. It's a sobering but important test — long-term care is the single largest unexpected expense that derails retirement plans, and the odds of needing some form of it in your lifetime are higher than most people realize (roughly 70% of people over 65 will need some level of long-term care).
+
+    ### 📊 TAXES
+    **Q: What is a "progressive" tax system? Why don't I just multiply my income by my tax rate?**
+    **A:** The US uses a system where higher income is taxed at progressively higher rates — but crucially, only the portion of your income that falls within each "bracket" is taxed at that bracket's rate. The common misconception is that if you're in the "24% tax bracket," all your income is taxed at 24%. That's wrong.
+
+    Think of it like filling buckets. The first $23,200 of a married couple's income fills the 10% bucket — taxed at just 10%. The next chunk of income fills the 12% bucket, and so on. Only income above the highest bracket threshold gets taxed at the top rate. This is why your actual tax bill is almost always less than your bracket rate would suggest, and why tax planning — like Roth conversions timed to stay within a lower bracket — can save significant money.
+
+    **Q: What is the difference between "marginal tax rate" and "effective tax rate"?**
+    **A:** Your marginal tax rate is the rate you'd pay on your next dollar of income — it's your "top bracket." If you're a married couple making $200,000, your marginal rate is 22% (meaning the last dollars of income are taxed at 22%).
+
+    Your effective tax rate is what you actually pay divided by your total income — your real average tax burden. Because of the progressive system and standard deduction, that same couple earning $200,000 might only pay an effective rate of 13-15% despite being in the 22% bracket.
+
+    The distinction matters enormously for Roth conversions. If you convert $10,000 from your Traditional IRA to Roth, the tax cost is your marginal rate on that $10,000 — not your effective rate. Planning to stay in lower marginal brackets can save thousands.
+
+    **Q: What is FICA and why does it disappear when I retire?**
+    **A:** FICA stands for Federal Insurance Contributions Act — it's the payroll tax that funds Social Security and Medicare. If you look at your pay stub right now, you'll see 6.2% going to Social Security (on income up to $168,600) and 1.45% going to Medicare — a total of 7.65% of every paycheck. Your employer pays an equal matching amount on your behalf.
+
+    The moment you retire and stop receiving W-2 wages, FICA taxes disappear completely. This is one of the reasons why your tax burden often drops significantly in early retirement — even if your investment income is similar to your working income, you no longer owe FICA on it. The app correctly applies FICA during your working years and removes it at retirement.
+
+    **Q: What is the "Standard Deduction" and how does it help me?**
+    **A:** The Standard Deduction is a flat amount the IRS lets you subtract from your income before calculating your taxes — no receipts required. For 2026, it's approximately $14,600 for single filers and $29,200 for married couples filing jointly. In practical terms, this means a married couple can have up to $29,200 in income and pay zero federal income tax. This is incredibly important in retirement planning because it creates a window of essentially tax-free income each year that can be used strategically for Roth conversions.
+
+    **Q: What is the "QBI Deduction" for business owners?**
+    **A:** If you own a business (sole proprietorship, S-Corp, partnership, or LLC), the IRS allows you to deduct up to 20% of your qualified business income before calculating your taxes — this is the Qualified Business Income (QBI) deduction, created by the 2017 Tax Cuts and Jobs Act. For example, if your business generates $100,000 in income, you might only pay taxes on $80,000 of it. The app automatically calculates and applies this deduction, phasing it out at higher income levels as the IRS requires.
+
+    ### 🔄 ROTH CONVERSIONS
+    **Q: What is a Roth conversion in plain English?**
+    **A:** A Roth conversion is a deliberate decision to move money from your Traditional 401(k) or IRA (where you'll owe taxes when you withdraw) into a Roth IRA (where all future growth and withdrawals are tax-free). You pay the income taxes on the converted amount now, in the current year.
+
+    Why would anyone voluntarily pay taxes early? Because of timing. If you retire at 65 but your RMDs don't start until 73, you have an 8-year window where your taxable income is relatively low. Converting during those years means you pay taxes at a lower rate than you would when RMDs force you to withdraw at potentially higher rates later. It's essentially buying future tax-free income at a discount.
+
+    **Q: How does the "Roth Conversion Optimizer" in this app work?**
+    **A:** When you enable the Roth Conversion Optimizer, it automatically identifies the years in your simulation where your taxable income is below your chosen target tax bracket ceiling. It then calculates exactly how much Traditional 401(k) money it can convert to Roth without pushing you over that bracket threshold. Crucially, it checks whether you actually have enough cash in your savings or brokerage accounts to pay the resulting tax bill — if you don't, it skips the conversion rather than creating artificial debt. Think of it as a tireless tax accountant working on your behalf every single year of your retirement.
+
+    ### 📈 INVESTMENT ASSUMPTIONS
+    **Q: What does "market growth rate" mean, and what's a realistic number to use?**
+    **A:** The market growth rate is the annual return you expect your investments to earn on average. The US stock market (S&P 500) has historically returned approximately 10% per year before inflation, or about 7% after inflation, over very long periods. However, this average masks enormous year-to-year swings — markets have dropped 30-50% in bad years and gained 25-30% in great years. A commonly used planning assumption is 6-8% for a diversified portfolio. The app defaults to 7% as a reasonable middle ground. Being too optimistic here is one of the most dangerous mistakes in retirement planning — consider using 5-6% for a more conservative estimate.
+
+    **Q: What is "inflation" and why does it matter so much over 30 years?**
+    **A:** Inflation is the rate at which prices rise over time — meaning the purchasing power of your money shrinks. At 3% annual inflation, something that costs $100 today will cost about $243 in 30 years. This has a devastating effect on fixed income streams that don't grow. A $50,000/year retirement income that felt comfortable in 2026 might feel quite tight in 2046 if it hasn't kept up with inflation. The app inflates every expense each year at your chosen inflation rate, which gives you a realistic picture of what your money will actually buy in the future rather than creating false optimism with today's dollars.
+
+    **Q: What does "View in Today's Dollars" do on the charts?**
+    **A:** When this toggle is OFF, the charts show you raw future dollar amounts — which look large because inflation has inflated them. A $3 million net worth in 2055 sounds impressive, but if inflation averaged 3% over 30 years, it only has the purchasing power of about $1.2 million today.
+
+    When you turn this toggle ON, the app mathematically "deflates" every future number back to what it would feel like in today's purchasing power. This makes it much easier to intuitively understand whether future amounts are actually comfortable or not. Many financial planners recommend planning primarily in today's dollars for exactly this reason.
+
+    **Q: What is the "Investment Glidepath" and why would I want it?**
+    **A:** A glidepath is the gradual shift from aggressive (mostly stocks) to conservative (mostly bonds) investing as you age. The logic is straightforward: a 35-year-old can ride out a market crash because they have 30 years for the market to recover. A 75-year-old who experiences a 40% market crash has far fewer years to recover and may be forced to sell at a loss to cover living expenses. The app's glidepath toggle simulates this shift by automatically reducing the assumed market return rate on your Traditional 401(k) and brokerage accounts by 1% for every 5 years you spend in retirement. It's a conservative safety feature that prevents your late-retirement projections from being unrealistically optimistic.
+
+    **Q: What is "Sequence of Returns Risk"?**
+    **A:** This is one of the most misunderstood retirement risks. The order in which you experience market returns matters enormously once you're withdrawing from your portfolio — not just the average return. If the market crashes 40% in your first year of retirement and you're forced to sell investments to cover living expenses, you're locking in permanent losses at the worst possible time. Even if the market recovers beautifully over the next decade, you have fewer shares left to benefit from that recovery. Someone who retires in a bull market year and experiences the same average returns over 30 years can end up with dramatically more money than someone who retires in a crash year, purely due to timing luck. The "-25% Market Crash at Retirement" stress test directly simulates this risk so you can see your plan's vulnerability.
+
+    ### 🎲 MONTE CARLO SIMULATION
+    **Q: What is Monte Carlo simulation in plain English?**
+    **A:** Imagine running your retirement plan 200 times in parallel, but each time the stock market behaves differently — sometimes great, sometimes terrible, sometimes mediocre. Monte Carlo simulation does exactly that, mathematically. It takes your real financial plan and runs it through hundreds of randomly generated market scenarios based on historical volatility patterns.
+
+    The result is a "probability of success" percentage — how often your plan survived without running out of money across all those scenarios. An 85% success rate means that in 85 out of 100 randomly generated futures, your money lasted. A 60% success rate means you're essentially flipping a coin, and you should probably adjust your plan.
+
+    **Q: What is "volatility" and what number should I use?**
+    **A:** Volatility measures how wildly your investment returns swing from year to year. The S&P 500 has historically had a volatility (standard deviation) of about 15-17% — meaning in any given year, returns are typically within about 15% of the average in either direction. A portfolio with more bonds has lower volatility (around 5-8%). Higher volatility means more dramatic swings, which creates more scenarios where bad luck at the wrong moment destroys your plan. For a stock-heavy retirement portfolio, 15% is a reasonable default. For a balanced portfolio (50/50 stocks and bonds), 10% is more appropriate.
+
+    **Q: What does "probability of success" actually mean? Is 100% the goal?**
+    **A:** Not necessarily. A 100% success rate sounds ideal, but achieving it often means either working much longer than needed, saving far more than necessary, or spending far less in retirement than you could comfortably afford. Most financial planners consider an 85-90% success rate to be a well-calibrated retirement plan — it means you've accounted for realistic risk without being so conservative that you sacrifice your quality of life. Below 70% is generally considered concerning. Below 50% means the plan needs significant revision. Think of it less as a binary pass/fail and more as a dial you can adjust by retiring a year later, spending slightly less, or saving a bit more.
+
+    ### 💾 SAVING & SECURITY
+    **Q: Is my financial data safe?**
+    **A:** Your data is stored in Google Firebase — one of the most secure cloud storage platforms in the world, used by millions of applications globally. Your account is protected by email and password authentication. That said, no online system is completely immune to risk, so we recommend using a strong, unique password and not entering information you wouldn't be comfortable with your financial advisor seeing. This app is a planning tool — you don't need to enter actual account numbers, social security numbers, or banking credentials anywhere. Only use estimated balances and income figures.
+
+    **Q: What happens to my data if I use "Guest Mode"?**
+    **A:** In Guest Mode, everything you enter exists only in your current browser session. The moment you close the browser tab or refresh the page, all of your data is permanently gone. Guest Mode is great for a quick exploration of the app's features, but if you want to save your plan and return to it later, you need to create a free account and click the "Save" button at the bottom of the page.
+
+    **Q: How often should I update my plan?**
+    **A:** At minimum, once a year — ideally around tax time when your financial documents are fresh. You should also update it immediately after any major life event: a new job or significant raise, a marriage or divorce, having or adopting a child, buying or selling a home, receiving an inheritance, or making a major change to your retirement timeline. Your plan is only as useful as it is current. A financial model built on last year's numbers in a year of major life change is worse than useless — it gives you false confidence.
+
+    **Q: What does the "Save Full Profile to Cloud Server" button do?**
+    **A:** This button takes every single piece of information you've entered across all sections of the app — your income, assets, debts, expenses, family details, and simulation assumptions — and saves it permanently to your secure account in the cloud. The next time you log in from any device, everything will be exactly where you left it. Until you click this button, your changes exist only in your current browser session. It's strongly recommended to save after every meaningful session.
     """)
 
 # --- FINAL SAVE CORE ---
@@ -2448,7 +2673,10 @@ if st.button("🚀 Save Full Profile to Cloud Server", type="primary", width="st
             rows = df[df[k].astype(str) != ""].to_dict('records')
             for r in rows:
                 for vk, vv in r.items():
-                    if pd.isna(vv): r[vk] = None
+                    try:
+                        if pd.isna(vv): r[vk] = None
+                    except (TypeError, ValueError):
+                        pass
             return rows
 
 
