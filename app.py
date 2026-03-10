@@ -940,6 +940,9 @@ with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expand
                              109: 3.7, 110: 3.5, 111: 3.4, 112: 3.3, 113: 3.1, 114: 3.0, 115: 2.9, 116: 2.8, 117: 2.7,
                              118: 2.5, 119: 2.3, 120: 2.0}
 
+        my_life_exp_val = my_life_exp if my_life_exp else 95
+        spouse_life_exp_val = spouse_life_exp if has_spouse and spouse_life_exp else 0
+
         primary_retire_year = my_birth_year + ret_age
         spouse_retire_year = spouse_birth_year + s_ret_age if has_spouse else 9999
 
