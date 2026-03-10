@@ -626,12 +626,12 @@ budget_categories = ["Housing / Rent", "Transportation", "Food", "Utilities", "I
                      "Entertainment", "Education", "Personal Care", "Subscriptions", "Travel", "Debt Payments", "Other"]
 
 # --- 4. LIFESTYLE BUDGETS ---
-with st.expander("💸 4. Lifestyle Budgets (Current & Retirement)", expanded=False):
+with st.expander("💸 4. Lifestyle Budgets & Milestones", expanded=False):
     st.markdown(
         '<div class="info-text">💡 <strong>AI Budget Builder:</strong> Our AI looks at your city, family size, and income to build a realistic, localized budget. <br><br><strong>Double-Counting Guard:</strong> The simulation automatically ignores "Housing" (if you own) and "Debt Payments" listed below, as it pulls the exact costs from your Assets & Debts section!</div>',
         unsafe_allow_html=True)
 
-    tab_curr, tab_ret = st.tabs(["📅 Current Budget", "🏖️ Retirement Budget"])
+    tab_curr, tab_ret, tab_mile = st.tabs(["📅 Current Budget", "🏖️ Retirement Budget", "🎉 One-Time Milestones"])
 
     with tab_curr:
         df_c = pd.DataFrame(st.session_state['current_expenses'])
@@ -751,69 +751,68 @@ with st.expander("💸 4. Lifestyle Budgets (Current & Retirement)", expanded=Fa
                 save_requested = True
                 st.toast("✅ Ret. Budget Saved!", icon="💾")
 
-# --- 5. MILESTONES ---
-with st.expander("🎉 5. AI Life Milestone Forecaster", expanded=False):
-    st.markdown(
-        '<div class="info-text">💡 <strong>Multi-Year Events & 529s:</strong> Ensure you set an End Date for events that span multiple years (like a 4-year degree). The engine will automatically drain any 529 Plans first to pay for expenses with "College", "School" or "Tuition" in the description!<br><br><strong>AI Estimator:</strong> Make sure to include <strong>who</strong> the event is for (e.g., "Sarah\'s College Tuition" or "Shray\'s Wedding") so the AI can calculate exact start dates and future costs based on their current age!</div>',
-        unsafe_allow_html=True)
-    df_m = pd.DataFrame(st.session_state['one_time_events'])
-    current_date_str = f"{datetime.date.today().month:02d}/{datetime.date.today().year}"
-    if df_m.empty:
-        df_m = pd.DataFrame(
-            [{"Description": "Child College Tuition", "Type": "Expense", "Frequency": "Yearly", "Amount ($)": 0,
-              "Start Date (MM/YYYY)": current_date_str, "End Date (MM/YYYY)": "", "AI Estimate?": False}])
-    else:
-        if "AI Estimate?" not in df_m.columns: df_m["AI Estimate?"] = False
-        df_m = df_m.reindex(
-            columns=["Description", "Type", "Frequency", "Amount ($)", "Start Date (MM/YYYY)", "End Date (MM/YYYY)",
-                     "AI Estimate?"])
+    with tab_mile:
+        st.markdown(
+            '<div class="info-text">💡 <strong>Multi-Year Events & 529s:</strong> Ensure you set an End Date for events that span multiple years (like a 4-year degree). The engine will automatically drain any 529 Plans first to pay for expenses with "College", "School" or "Tuition" in the description!<br><br><strong>AI Estimator:</strong> Make sure to include <strong>who</strong> the event is for (e.g., "Sarah\'s College Tuition" or "Shray\'s Wedding") so the AI can calculate exact start dates and future costs based on their current age!</div>',
+            unsafe_allow_html=True)
+        df_m = pd.DataFrame(st.session_state['one_time_events'])
+        current_date_str = f"{datetime.date.today().month:02d}/{datetime.date.today().year}"
+        if df_m.empty:
+            df_m = pd.DataFrame(
+                [{"Description": "Child College Tuition", "Type": "Expense", "Frequency": "Yearly", "Amount ($)": 0,
+                  "Start Date (MM/YYYY)": current_date_str, "End Date (MM/YYYY)": "", "AI Estimate?": False}])
+        else:
+            if "AI Estimate?" not in df_m.columns: df_m["AI Estimate?"] = False
+            df_m = df_m.reindex(
+                columns=["Description", "Type", "Frequency", "Amount ($)", "Start Date (MM/YYYY)", "End Date (MM/YYYY)",
+                         "AI Estimate?"])
 
-    edited_m = st.data_editor(
-        df_m,
-        column_config={
-            "Type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income / Windfall"]),
-            "Frequency": st.column_config.SelectboxColumn("Frequency", options=["One-Time", "Monthly", "Yearly"]),
-            "Amount ($)": st.column_config.NumberColumn("Amount ($)", step=1000, format="$%d"),
-            "Start Date (MM/YYYY)": st.column_config.TextColumn("Start (MM/YYYY)",
-                                                                validate=r"^(0?[1-9]|1[0-2])\/[0-9]{4}$"),
-            "End Date (MM/YYYY)": st.column_config.TextColumn("End (MM/YYYY)",
-                                                              validate=r"^(0?[1-9]|1[0-2])\/[0-9]{4}$"),
-            "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI Estimate?")
-        }, num_rows="dynamic", width="stretch", hide_index=True, key="mil_ed"
-    )
+        edited_m = st.data_editor(
+            df_m,
+            column_config={
+                "Type": st.column_config.SelectboxColumn("Type", options=["Expense", "Income / Windfall"]),
+                "Frequency": st.column_config.SelectboxColumn("Frequency", options=["One-Time", "Monthly", "Yearly"]),
+                "Amount ($)": st.column_config.NumberColumn("Amount ($)", step=1000, format="$%d"),
+                "Start Date (MM/YYYY)": st.column_config.TextColumn("Start (MM/YYYY)",
+                                                                    validate=r"^(0?[1-9]|1[0-2])\/[0-9]{4}$"),
+                "End Date (MM/YYYY)": st.column_config.TextColumn("End (MM/YYYY)",
+                                                                  validate=r"^(0?[1-9]|1[0-2])\/[0-9]{4}$"),
+                "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI Estimate?")
+            }, num_rows="dynamic", width="stretch", hide_index=True, key="mil_ed"
+        )
 
-    col_ai_m, col_sv_m = st.columns([3, 1])
-    with col_ai_m:
-        st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("✨ Forecast Milestone Timelines & Costs (AI)", use_container_width=True):
-            with st.spinner("AI is mapping out your timeline and projecting future costs..."):
-                valid = edited_m[edited_m["Description"].astype(str) != ""].to_dict('records')
-                prompt = f"Family Context: {f_ctx}. Current Date: {current_date_str}. Calculate Start/End dates (MM/YYYY) and future Amounts in today's dollars for: {json.dumps(valid)}. Note: For multi-year events like College, ensure the End Date correctly reflects the duration (e.g. 4 years later). Return ONLY a JSON array."
-                res = call_gemini_json(prompt)
-                if res and isinstance(res, list):
-                    st.session_state['one_time_events'] = res
-                    st.rerun()
-    with col_sv_m:
-        st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("💾 Save Milestones", key="sv_5", use_container_width=True):
-            save_requested = True
-            st.toast("✅ Milestones Saved!", icon="💾")
+        col_ai_m, col_sv_m = st.columns([3, 1])
+        with col_ai_m:
+            st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
+            if st.button("✨ Forecast Milestone Timelines & Costs (AI)", use_container_width=True):
+                with st.spinner("AI is mapping out your timeline and projecting future costs..."):
+                    valid = edited_m[edited_m["Description"].astype(str) != ""].to_dict('records')
+                    prompt = f"Family Context: {f_ctx}. Current Date: {current_date_str}. Calculate Start/End dates (MM/YYYY) and future Amounts in today's dollars for: {json.dumps(valid)}. Note: For multi-year events like College, ensure the End Date correctly reflects the duration (e.g. 4 years later). Return ONLY a JSON array."
+                    res = call_gemini_json(prompt)
+                    if res and isinstance(res, list):
+                        st.session_state['one_time_events'] = res
+                        st.rerun()
+        with col_sv_m:
+            st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
+            if st.button("💾 Save Milestones", key="sv_5", use_container_width=True):
+                save_requested = True
+                st.toast("✅ Milestones Saved!", icon="💾")
 
 # --- 6. INTERACTIVE DASHBOARD & SIMULATION ---
-with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expanded=True):
-    st.markdown("### 🎛️ Simulation Controls")
+with st.expander("📈 5. Interactive Retirement Simulation & Analytics", expanded=True):
+    st.markdown("### 🎛️ Simulation Command Center")
+    tab_time, tab_macro, tab_adv = st.tabs(["⏳ Timelines", "📊 Macro & Taxes", "⚙️ Advanced Scenarios"])
 
-    # Core Controls Row 1
-    cc1, cc2, cc3, cc4 = st.columns(4)
-    ret_age = cc1.slider("Retirement Age", int(my_age), 100, int(p_info.get('retire_age', 65)))
-    s_ret_age = cc2.slider("Spouse Retire Age", int(spouse_age), 100,
-                           int(p_info.get('spouse_retire_age', 65))) if has_spouse else None
-    my_life_exp = cc3.slider("Your Life Expectancy", 70, 115, int(p_info.get('my_life_exp', 95)))
-    spouse_life_exp = cc4.slider("Spouse Life Expectancy", 70, 115,
-                                 int(p_info.get('spouse_life_exp', 95))) if has_spouse else None
+    with tab_time:
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        ret_age = cc1.slider("Retirement Age", int(my_age), 100, int(p_info.get('retire_age', 65)))
+        s_ret_age = cc2.slider("Spouse Retire Age", int(spouse_age), 100,
+                               int(p_info.get('spouse_retire_age', 65))) if has_spouse else None
+        my_life_exp = cc3.slider("Your Life Expectancy", 70, 115, int(p_info.get('my_life_exp', 95)))
+        spouse_life_exp = cc4.slider("Spouse Life Expectancy", 70, 115,
+                                     int(p_info.get('spouse_life_exp', 95))) if has_spouse else None
 
-    # --- ASSUMPTIONS BLOCK ---
-    with st.expander("📊 Macroeconomic & Tax Assumptions", expanded=False):
+    with tab_macro:
         st.markdown(
             '<div class="info-text">💡 <strong>AI Estimation:</strong> Click the ✨ AI button next to any field to have the AI estimate a realistic, localized value based on historical data and your profile!</div>',
             unsafe_allow_html=True)
@@ -889,12 +888,7 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
                                 f"User plans to retire in {ret_city_state} with estimated retirement income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'retire_tax_rate': float}}",
                                 ac9)
 
-        st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("💾 Save Assumptions", key="sv_assumptions", use_container_width=True):
-            save_requested = True
-            st.toast("✅ Assumptions Saved!", icon="💾")
-
-    with st.expander("⚙️ Advanced Scenarios & Tax Optimization", expanded=False):
+    with tab_adv:
         st.markdown(
             '<div class="info-text">💡 <strong>Tax Engine & Stress Tests:</strong> Our engine uses 2026 IRS tax brackets and dynamically calculates Federal, State, and FICA taxes. It also integrates Medicare IRMAA surcharges, Capital Gains Step-Up Basis on death, and Spousal Social Security survivor benefits.</div>',
             unsafe_allow_html=True)
@@ -930,13 +924,15 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
                                        index=roth_target_idx,
                                        help="The AI will convert just enough Traditional funds each year to reach the very top of this selected tax bracket.")
 
-        st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
-        if st.button("💾 Save Advanced Settings", key="sv_7"):
-            save_requested = True
-            st.session_state['assumptions']['roth_conversions'] = roth_conversions
-            st.session_state['assumptions']['roth_target'] = roth_target
-            st.session_state['assumptions']['withdrawal_strategy'] = active_withdrawal_strategy.split(' ')[0]
-            st.toast("✅ Settings Saved!", icon="💾")
+    st.markdown('<div class="save-btn-marker"></div>', unsafe_allow_html=True)
+    if st.button("💾 Save All Settings", key="sv_7"):
+        save_requested = True
+        st.session_state['assumptions']['roth_conversions'] = roth_conversions
+        st.session_state['assumptions']['roth_target'] = roth_target
+        st.session_state['assumptions']['withdrawal_strategy'] = active_withdrawal_strategy.split(' ')[0]
+        st.toast("✅ Settings Saved!", icon="💾")
+
+    st.divider()
 
     # --- SIMULATION ENGINE ---
     if my_age > 0:
@@ -2031,7 +2027,7 @@ with st.expander("📈 6. Interactive Retirement Simulation & Analytics", expand
             mc_runs = col_mc2.number_input("Number of Simulations", min_value=10, max_value=500, value=100, step=10)
 
             with col_mc3:
-                st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+                st.markdown("<div style='height: 27px;'></div>", unsafe_allow_html=True)
                 st.markdown('<div class="ai-btn-marker"></div>', unsafe_allow_html=True)
                 if st.button("✨ Run Monte Carlo Simulation", use_container_width=True):
                     with st.spinner(f"Rendering {mc_runs} parallel market sequences..."):
