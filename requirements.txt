@@ -4,3 +4,4 @@ requests
 firebase-admin
 extra-streamlit-components
 plotly
+openpyxl
