@@ -5,3 +5,4 @@ firebase-admin
 extra-streamlit-components
 plotly
 openpyxl
+streamlit_option_menu

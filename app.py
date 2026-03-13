@@ -13,11 +13,13 @@ import io
 import os
 import numpy as np
 import concurrent.futures
-from dateutil.relativedelta import relativedelta
 import warnings
 import firebase_admin
+import hashlib
+import functools
 from firebase_admin import credentials, firestore
 from concurrent.futures import ThreadPoolExecutor
+from dateutil.relativedelta import relativedelta
 
 try:
     import plotly.graph_objects as go
@@ -54,6 +56,32 @@ MEDICARE_GAP_COST, LTC_SHOCK_COST = 15000, 100000
 WIDOW_EXPENSE_MULTIPLIER = 0.60
 MEDICARE_CLIFF_SINGLE_DROP = 0.25
 ROTH_CASH_BUFFER_MARGIN = 0.95
+
+# --- IRS 2025/2026 TAX BRACKET BASELINES ---
+# These serve as Year 0 for the simulation. The engine auto-inflates them for future years.
+STD_DEDUCTION = {"MFJ": 30000, "Single": 15000}
+
+TAX_BRACKETS = {
+    "MFJ": [
+        (23850, 0.10), (96950, 0.12), (206700, 0.22), 
+        (394600, 0.24), (501050, 0.32), (751600, 0.35)
+    ],
+    "Single": [
+        (11925, 0.10), (48475, 0.12), (103350, 0.22), 
+        (197300, 0.24), (250525, 0.32), (626350, 0.35)
+    ]
+}
+
+ROTH_TARGET_LIMITS = {
+    "MFJ": {"12%": 96950, "22%": 206700, "24%": 394600, "32%": 501050},
+    "Single": {"12%": 48475, "22%": 103350, "24%": 197300, "32%": 250525}
+}
+
+LTCG_THRESHOLDS = {
+    "MFJ": (96600, 600050),
+    "Single": (48300, 533400)
+}
+
 BUDGET_CATEGORIES = ["Housing / Rent", "Transportation", "Food", "Utilities", "Insurance", "Healthcare",
                      "Entertainment", "Education", "Personal Care", "Subscriptions", "Travel", "Debt Payments", "Other"]
 
@@ -76,6 +104,22 @@ def update_state(key, val):
 
 def mark_dirty():
     st.session_state['dirty'] = True
+    
+    # Purge stale Monte Carlo results
+    st.session_state['mc_success_rate'] = None
+    if 'mc_raw_results' in st.session_state:
+        st.session_state['mc_raw_results'] = None
+
+    # --- FIX: Invalidate Stale AI Reports ---
+    # We clear these so the user doesn't see advice based on old data
+    if 'ai_analysis_report' in st.session_state:
+        del st.session_state['ai_analysis_report']
+    if 'what_if_analysis_report' in st.session_state:
+        del st.session_state['what_if_analysis_report']
+        
+    # Invalidate the cached simulation context
+    if '_sim_ctx' in st.session_state:
+        del st.session_state['_sim_ctx']
 
 
 def get_completion_status():
@@ -161,13 +205,46 @@ def scrub_records(records):
     for r in records:
         new_r = {}
         for k, v in r.items():
-            if v is None or (isinstance(v, float) and math.isnan(v)):
+            # pd.isna() is the magic bullet—it catches ALL Pandas missing types universally
+            if pd.isna(v):
                 new_r[k] = None
             else:
                 new_r[k] = v
         scrubbed.append(new_r)
     return scrubbed
 
+def sanitize_for_cache(obj, decimals=4):
+    """
+    Recursively rounds all floats in a nested dictionary/list structure to prevent 
+    floating-point noise from busting Streamlit's JSON string cache keys.
+    """
+    if isinstance(obj, float):
+        return round(obj, decimals)
+    elif isinstance(obj, dict):
+        return {k: sanitize_for_cache(v, decimals) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_for_cache(item, decimals) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(sanitize_for_cache(item, decimals) for item in obj)
+    return obj
+
+def sanitize_for_ai(obj):
+    """
+    Recursively sanitizes user data to prevent AI prompt injection attacks.
+    Strips system/markdown characters, truncates length, and blocks injection keywords.
+    """
+    if isinstance(obj, str):
+        # 1. Strip dangerous system/markdown characters and truncate to 200 chars
+        cleaned = re.sub(r'[`{}<>|]', '', obj)[:200]
+        # 2. Block overt prompt injection commands
+        if any(cmd in cleaned.lower() for cmd in ['ignore previous', 'ignore all', 'system prompt', 'forget instructions']):
+            return "[REDACTED SECURITY VIOLATION]"
+        return cleaned.strip()
+    elif isinstance(obj, dict):
+        return {str(k): sanitize_for_ai(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [sanitize_for_ai(item) for item in obj]
+    return obj
 
 def apply_chart_theme(fig, title=""):
     fig.update_layout(
@@ -176,23 +253,23 @@ def apply_chart_theme(fig, title=""):
         font=dict(family="Inter", color="#64748b", size=12), hovermode="x unified",
         hoverlabel=dict(bgcolor="white", bordercolor="#e2e8f0", font_size=13, font_family="Inter"),
         
-        # --- FIX: Center the legend globally and push it slightly higher ---
+        # --- FIX: Mobile-Responsive Legend Placement ---
         legend=dict(
             orientation="h", 
-            yanchor="bottom", 
-            y=1.08, 
+            yanchor="top",     # Anchor to the top of the legend box...
+            y=-0.2,            # ...and push it safely below the X-axis
             xanchor="center", 
             x=0.5, 
             bgcolor="rgba(0,0,0,0)",
-            font=dict(size=12)
+            font=dict(size=11),
+            itemwidth=70       # Forces uniform wrapping on narrow mobile screens
         ),
         
         xaxis=dict(showgrid=False, zeroline=False, color="#94a3b8", tickfont=dict(size=11)),
         yaxis=dict(gridcolor="#f1f5f9", zeroline=False, tickformat="$,.0f", color="#94a3b8", tickfont=dict(size=11)),
         
-        # --- FIX: Only enforce the top margin (to protect the legend). 
-        # Let Plotly auto-calculate Left, Right, and Bottom margins to prevent clipping! ---
-        margin=dict(t=90) 
+        # --- FIX: Adjust margins to give the top breathing room and the bottom room for the legend ---
+        margin=dict(t=60, b=120) 
     )
     return fig
 
@@ -257,6 +334,50 @@ def render_total(label, series):
         f"<div style='text-align: right; font-weight: 700; color: #4f46e5; font-size: 1.1rem; padding-top: 8px;'>{label}: <span style='color: #0f172a;'>${total:,.0f}</span></div>",
         unsafe_allow_html=True)
 
+def bootstrap_session_state():
+    """Ensures all required keys exist to prevent rendering crashes on refresh."""
+    defaults = {
+        'income_data': [],
+        'liquid_assets_data': [],
+        'real_estate_data': [],
+        'business_data': [],
+        'liabilities_data': [],
+        'lifetime_expenses': [],
+        'assumptions': {
+            'infl': 2.5, 
+            'inv_growth': 6.0, 
+            'housing_growth': 3.0, 
+            'tax_rate': 22.0
+        },
+        'ret_age': 65,  # Fallback retirement age
+        'profile_data': {},
+        'dirty': False
+    }
+    
+    for key, default_val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = default_val
+
+# --- FIX: Guarantee core state exists BEFORE Auth or Firebase ---
+bootstrap_session_state()
+
+def sync_editor_state(state_key, new_records):
+    """
+    Safely compares new data editor records against session state to prevent infinite rerun loops.
+    Forces key sorting and float sanitization before comparing JSON hashes.
+    """
+    old_records = scrub_records(st.session_state.get(state_key, []))
+    
+    # 1. Sanitize floats to 4 decimals to kill precision noise
+    # 2. sort_keys=True guarantees dictionary order doesn't trigger false positives
+    new_safe = json.dumps(sanitize_for_cache(new_records), sort_keys=True)
+    old_safe = json.dumps(sanitize_for_cache(old_records), sort_keys=True)
+    
+    if new_safe != old_safe:
+        st.session_state[state_key] = new_records
+        mark_dirty()  # <--- FIX: THE MISSING LINK!
+        return True
+    return False
 
 # --- DESIGN SYSTEM & CSS ---
 if os.path.exists("style.css"):
@@ -300,24 +421,28 @@ def sign_up(email, password): return requests.post(
     json={"email": email, "password": password, "returnSecureToken": True}).json()
 
 
-def load_user_data(email):
-    if email == "guest_demo" or not st.session_state.get('firebase_enabled', False): return {}
-    doc = db.collection('users').document(email).get()
+def load_user_data(uid):
+    if uid == "guest_demo" or not st.session_state.get('firebase_enabled', False): return {}
+    # --- FIX: Query by secure UID instead of email ---
+    doc = db.collection('users').document(uid).get()
     return doc.to_dict() if doc.exists else {}
 
 
 def save_profile():
-    if st.session_state.get('user_email') == "guest_demo": st.error(
-        "Persistent configurations disabled within the demonstration environment."); return
-    if not st.session_state.get('firebase_enabled', True): st.error(
-        "Cloud saving disabled due to connection issues."); return
+    # --- FIX: Check Guest status via UID ---
+    if st.session_state.get('user_uid') == "guest_demo": 
+        st.error("Persistent configurations disabled within the demonstration environment.")
+        return
+    if not st.session_state.get('firebase_enabled', True): 
+        st.error("Cloud saving disabled due to connection issues.")
+        return
 
     my_age = relativedelta(datetime.date.today(), st.session_state.get('my_dob', datetime.date(1980, 1, 1))).years
-    spouse_age = relativedelta(datetime.date.today(), st.session_state.get('spouse_dob', datetime.date(1982, 1,
-                                                                                                       1))).years if st.session_state.get(
-        'has_spouse') else 0
+    spouse_age = relativedelta(datetime.date.today(), st.session_state.get('spouse_dob', datetime.date(1982, 1, 1))).years if st.session_state.get('has_spouse') else 0
 
     user_data = {
+        # --- FIX: Store the email inside the document safely for backend admin lookups ---
+        "account_email": st.session_state.get('user_email', ''), 
         "personal_info": {
             "name": st.session_state.get('my_name', ''),
             "dob": st.session_state.get('my_dob', datetime.date(1980, 1, 1)).strftime("%Y-%m-%d"),
@@ -341,12 +466,21 @@ def save_profile():
         "lifetime_expenses": clean_df(pd.DataFrame(st.session_state.get('lifetime_expenses', [])), "Description"),
         "assumptions": st.session_state.get('assumptions', {})
     }
-    db.collection('users').document(st.session_state['user_email']).set(user_data)
-    st.session_state['user_data'] = user_data
-    st.session_state['dirty'] = False
-    st.toast("✅ Complete Financial Blueprint Synchronized Successfully!")
-    st.rerun()
-
+    try:
+        # --- FIX: Save to the secure UID path ---
+        db.collection('users').document(st.session_state['user_uid']).set(user_data, merge=True)
+                
+        # Update local cache and clear dirty flag only after a confirmed successful write
+        st.session_state['user_data'] = user_data
+        st.session_state['dirty'] = False
+        st.toast("✅ Complete Financial Blueprint Synchronized Successfully!")
+        time.sleep(0.5)
+        st.rerun()
+        
+    except Exception as e:
+        # --- FIX: Graceful Error Handling for Network/Permission issues ---
+        st.error(f"🚨 Cloud Sync Failed: {str(e)}")
+        st.info("Your changes are still in your browser session. Please check your internet connection and try saving again.")
 
 def call_gemini_json(prompt, retries=3):
     if not GEMINI_API_KEY:
@@ -483,12 +617,18 @@ def initialize_session_state():
         st.session_state['dirty'] = False
         st.session_state['initialized'] = True
 
+        # --- FIX: Automate the "second click" to lock data into memory ---
+        st.rerun()
 
-if 'user_email' not in st.session_state:
-    saved_email = cookie_manager.get(cookie="user_email")
-    if saved_email and not st.session_state.get('logged_out_flag'):
-        st.session_state['user_email'] = saved_email
-        st.session_state['user_data'] = load_user_data(saved_email)
+if 'user_uid' not in st.session_state:
+    # --- FIX: Read the secure UID from the cookie ---
+    saved_uid = cookie_manager.get(cookie="user_uid")
+    if saved_uid and not st.session_state.get('logged_out_flag'):
+        # Note: We also clear out legacy email cookies if they exist to force a clean transition
+        st.session_state['user_uid'] = saved_uid
+        st.session_state['user_data'] = load_user_data(saved_uid)
+        st.session_state['user_email'] = st.session_state['user_data'].get('account_email', '')
+        st.session_state['initialized'] = False 
         st.rerun()
 
     st.markdown(
@@ -499,37 +639,48 @@ if 'user_email' not in st.session_state:
         tab1, tab2 = st.tabs(["Secure Login", "New Account"])
         with tab1:
             le, lp = st.text_input("Email", key="le"), st.text_input("Password", type="password", key="lp")
-            if st.button("Sign In", type="primary", use_container_width=True):
+            if st.button("Sign In", type="primary", width='stretch'):
                 res = sign_in(le, lp)
                 if "idToken" in res:
                     st.session_state.pop('logged_out_flag', None)
-                    st.session_state['user_email'] = res['email'];
-                    st.session_state['user_data'] = load_user_data(res['email'])
-                    cookie_manager.set("user_email", res['email'],
-                                       expires_at=datetime.datetime.now() + datetime.timedelta(days=30))
-                    time.sleep(0.2);
+                    st.session_state['user_email'] = res['email']
+                    # --- FIX: Extract and cache the secure UID ---
+                    st.session_state['user_uid'] = res['localId']
+                    st.session_state['user_data'] = load_user_data(res['localId'])
+                    st.session_state['initialized'] = False 
+                    
+                    # --- FIX: Save UID to the cookie, not the email ---
+                    cookie_manager.set("user_uid", res['localId'],
+                                       expires_at=datetime.datetime.now() + datetime.timedelta(days=1))
+                    time.sleep(0.2)
                     st.rerun()
                 else:
                     st.error("Login failed. Please check your email and password.")
         with tab2:
             se, sp = st.text_input("New Email", key="se"), st.text_input("New Password", type="password", key="sp")
-            if st.button("Create Account", type="primary", use_container_width=True):
+            if st.button("Create Account", type="primary", width='stretch'):
                 if len(sp) >= 6:
                     res = sign_up(se, sp)
                     if "idToken" in res:
                         st.session_state.pop('logged_out_flag', None)
-                        st.session_state['user_email'] = res['email'];
+                        st.session_state['user_email'] = res['email']
+                        # --- FIX: Extract and cache the secure UID ---
+                        st.session_state['user_uid'] = res['localId']
                         st.session_state['user_data'] = {}
-                        cookie_manager.set("user_email", res['email'],
-                                           expires_at=datetime.datetime.now() + datetime.timedelta(days=30))
-                        time.sleep(0.2);
+                        
+                        # --- FIX: Save UID to the cookie, not the email ---
+                        cookie_manager.set("user_uid", res['localId'],
+                                           expires_at=datetime.datetime.now() + datetime.timedelta(days=1))
+                        time.sleep(0.2)
                         st.rerun()
                 else:
                     st.warning("Min 6 characters.")
         st.divider()
-        if st.button("🚀 Try the Demo (Guest Mode)", use_container_width=True):
+        if st.button("🚀 Try the Demo (Guest Mode)", width='stretch'):
             st.session_state.pop('logged_out_flag', None)
-            st.session_state['user_email'] = "guest_demo"
+            st.session_state['user_email'] = "guest_email@demo.com"
+            # --- FIX: Assign a mock UID for guest mode ---
+            st.session_state['user_uid'] = "guest_demo"
             
             # --- FIX: Pre-load the "Johnson Family" to demonstrate the engine's capabilities immediately ---
             st.session_state['user_data'] = {
@@ -579,7 +730,10 @@ if 'user_email' not in st.session_state:
                 }
             }
             
-            cookie_manager.set("user_email", "guest_demo", expires_at=datetime.datetime.now() + datetime.timedelta(days=1))
+            st.session_state['initialized'] = False
+
+            # --- FIX: Save mock UID to cookie ---
+            cookie_manager.set("user_uid", "guest_demo", expires_at=datetime.datetime.now() + datetime.timedelta(days=1))
             st.toast("Guest mode active: Demo profile loaded successfully!", icon="🚀")
             st.rerun()
     st.stop()
@@ -590,6 +744,10 @@ initialize_session_state()
 
 # --- MODULE LEVEL SIMULATION CORE (CACHED) ---
 def build_sim_context():
+    # --- FIX: Return cached context instantly if it exists ---
+    if '_sim_ctx' in st.session_state:
+        return st.session_state['_sim_ctx']
+
     current_year = datetime.date.today().year
     my_age = relativedelta(datetime.date.today(), st.session_state.get('my_dob', datetime.date(1980, 1, 1))).years
     spouse_age = relativedelta(datetime.date.today(), st.session_state.get('spouse_dob', datetime.date(1982, 1,
@@ -622,7 +780,8 @@ def build_sim_context():
     debt_records = [d for d in df_debt.to_dict('records') if
                     d.get("Debt Name") and safe_num(d.get("Current Balance ($)")) > 0] if not df_debt.empty else []
 
-    return {
+# --- FIX: Assign to a variable first so we can scrub it ---
+    raw_ctx = {
         'current_year': current_year, 'my_birth_year': my_birth_year, 'spouse_birth_year': spouse_birth_year,
         'primary_end_year': primary_end_year, 'spouse_end_year': spouse_end_year,
         'has_spouse': st.session_state.get('has_spouse', False),
@@ -649,6 +808,12 @@ def build_sim_context():
         'exp_records': scrub_records(st.session_state.get('lifetime_expenses', [])),
         'my_age': my_age, 'spouse_age': spouse_age
     }
+    
+    # --- FIX: Save the sanitized dictionary into session state before returning ---
+    clean_ctx = sanitize_for_cache(raw_ctx)
+    st.session_state['_sim_ctx'] = clean_ctx
+    
+    return clean_ctx
 
 # --- MODULE LEVEL STATIC RESOURCES & HELPERS ---
 IRS_UNIFORM_TABLE = {73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1, 80: 20.2, 81: 19.4,
@@ -658,36 +823,72 @@ IRS_UNIFORM_TABLE = {73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0,
                      110: 3.5, 111: 3.4, 112: 3.3, 113: 3.1, 114: 3.0, 115: 2.9, 116: 2.8, 117: 2.7, 118: 2.5,
                      119: 2.3, 120: 2.0}
 
+@functools.lru_cache(maxsize=1024)
+def get_irmaa_surcharge(magi, is_mfj, year_offset, inflation_rate, num_medicare):
+    if num_medicare <= 0: return 0
+    infl_f = (1 + inflation_rate / 100.0) ** year_offset
+    
+    # IRS IRMAA MAGI Brackets (MFJ limits are roughly 2x Single, except the top tier)
+    t1 = 103000 * infl_f * (2 if is_mfj else 1)
+    t2 = 129000 * infl_f * (2 if is_mfj else 1)
+    t3 = 161000 * infl_f * (2 if is_mfj else 1)
+    t4 = 193000 * infl_f * (2 if is_mfj else 1)
+    t5 = 500000 * infl_f * (1.5 if is_mfj else 1)
+    
+    surcharge = 0
+    if magi > t5: surcharge = 6500 * infl_f
+    elif magi > t4: surcharge = 5500 * infl_f
+    elif magi > t3: surcharge = 4000 * infl_f
+    elif magi > t2: surcharge = 2500 * infl_f
+    elif magi > t1: surcharge = 1000 * infl_f
+    
+    return surcharge * num_medicare
+
+# --- FIX: Config-Driven Memoized Tax Bracket Generators ---
+@functools.lru_cache(maxsize=1024)
+def get_tax_brackets(is_mfj, year_offset, inflation_rate):
+    infl_factor = (1 + inflation_rate / 100.0) ** year_offset
+    std_deduction = (STD_DEDUCTION["MFJ"] if is_mfj else STD_DEDUCTION["Single"]) * infl_factor
+
+    b_base = TAX_BRACKETS["MFJ"] if is_mfj else TAX_BRACKETS["Single"]
+    
+    adj_brackets = tuple((limit * infl_factor, rate) for limit, rate in b_base)
+    return std_deduction, adj_brackets
+
 def calc_federal_tax(ordinary_income, is_mfj, year_offset, inflation_rate):
-    infl_factor = (1 + inflation_rate / 100) ** year_offset
-    std_deduction = (29200 if is_mfj else 14600) * infl_factor
-    taxable_ordinary = max(0, ordinary_income - std_deduction)
+    std_deduction, adj_brackets = get_tax_brackets(is_mfj, year_offset, inflation_rate)
+    taxable = max(0, ordinary_income - std_deduction)
 
-    b_mfj = [(23200, 0.10), (94300, 0.12), (201050, 0.22), (383900, 0.24), (487450, 0.32), (731200, 0.35), (float('inf'), 0.37)]
-    b_single = [(11600, 0.10), (47150, 0.12), (100525, 0.22), (191950, 0.24), (243725, 0.32), (609350, 0.35), (float('inf'), 0.37)]
-    brackets = b_mfj if is_mfj else b_single
-
-    ord_tax, prev_limit = 0, 0
-    for limit, rate in brackets:
-        adj_limit = limit * infl_factor
-        if taxable_ordinary > prev_limit:
-            taxable_in_bracket = min(taxable_ordinary, adj_limit) - prev_limit
-            ord_tax += taxable_in_bracket * rate
-        prev_limit = adj_limit
-
-    marginal_rate = 0.10
-    for limit, rate in brackets:
-        if taxable_ordinary < limit * infl_factor:
-            marginal_rate = rate
+    tax, prev_limit = 0, 0
+    marginal = 0.10
+    
+    for limit, rate in adj_brackets:
+        if taxable > prev_limit:
+            tax += (min(taxable, limit) - prev_limit) * rate
+        if taxable <= limit:
+            marginal = rate
             break
-    if taxable_ordinary > brackets[-1][0] * infl_factor: marginal_rate = 0.37
-    return ord_tax, marginal_rate
+        prev_limit = limit
+    else:
+        if taxable > prev_limit:
+            tax += (taxable - prev_limit) * 0.37
+        marginal = 0.37
+        
+    return tax, marginal
+
+
+@functools.lru_cache(maxsize=1024)
+def get_ltcg_thresholds(is_mfj, year_offset, inflation_rate):
+    infl_factor = (1 + inflation_rate / 100.0) ** year_offset
+    base_0, base_15 = LTCG_THRESHOLDS["MFJ"] if is_mfj else LTCG_THRESHOLDS["Single"]
+    return (
+        ADDL_MED_TAX_THRESHOLD * infl_factor,
+        base_0 * infl_factor,
+        base_15 * infl_factor
+    )
 
 def get_ltcg_rate(ordinary_income, is_mfj, year_offset, inflation_rate):
-    infl_factor = (1 + inflation_rate / 100) ** year_offset
-    niit_threshold = ADDL_MED_TAX_THRESHOLD * infl_factor
-    cg_threshold_0 = 94050 * infl_factor if is_mfj else 47025 * infl_factor
-    cg_threshold_15 = 583750 * infl_factor if is_mfj else 518900 * infl_factor
+    niit_threshold, cg_threshold_0, cg_threshold_15 = get_ltcg_thresholds(is_mfj, year_offset, inflation_rate)
 
     if ordinary_income < cg_threshold_0: base_rate = 0.0
     elif ordinary_income < cg_threshold_15: base_rate = 0.15
@@ -744,8 +945,8 @@ def _withdraw(a, current_shortfall, tax_treatment, ctx, my_current_age, spouse_c
     return current_shortfall - net_cash, tax_inc, withdrawn
 # ------------------------------------------------
 
-def run_simulation(mkt_sequence, ctx_input):
-    ctx = copy.deepcopy(ctx_input)
+# --- FIX: Removed redundant deepcopy for massive Monte Carlo performance boost ---
+def run_simulation(mkt_sequence, ctx):
     
     if ctx['max_years'] <= 0: return [], [], [], {}
 
@@ -758,9 +959,15 @@ def run_simulation(mkt_sequence, ctx_input):
         {"Account Name": "Unallocated Cash", "Type": "Checking/Savings", "Owner": "Me", "bal": 0.0, "contrib": 0.0,
          "growth": 0.0, "stop_at_ret": False}]
 
-    sim_debts = [{"bal": safe_num(d.get("Current Balance ($)")), "pmt": safe_num(d.get("Monthly Payment ($)")) * 12,
-                  "rate": safe_num(d.get("Interest Rate (%)")) / 100, "name": d.get("Debt Name")} for d in
-                 ctx['debt_records'] if d.get("Debt Name")]
+    # --- FIX: Hard filter out phantom debts with missing names or zero/negative balances ---
+    sim_debts = [
+        {"bal": safe_num(d.get("Current Balance ($)")), 
+         "pmt": safe_num(d.get("Monthly Payment ($)")) * 12,
+         "rate": safe_num(d.get("Interest Rate (%)")) / 100, 
+         "name": str(d.get("Debt Name")).strip()} 
+        for d in ctx.get('debt_records', []) 
+        if d.get("Debt Name") and str(d.get("Debt Name")).strip() != "" and safe_num(d.get("Current Balance ($)")) > 0
+    ]
     sim_re = [{"name": r.get("Property Name", "Property"), "is_primary": r.get("Is Primary Residence?", False),
                "val": safe_num(r.get("Market Value ($)")), "debt": safe_num(r.get("Mortgage Balance ($)")),
                "pmt": safe_num(r.get("Mortgage Payment ($)")) * 12, "exp": safe_num(r.get("Monthly Expenses ($)")) * 12,
@@ -885,8 +1092,9 @@ def run_simulation(mkt_sequence, ctx_input):
         # --- NEW: Track Roth Taxes separately for the year ---
         roth_fed_tax_paid = 0.0
         roth_state_tax_paid = 0.0
-
+        total_withdrawals = 0
         annual_inc, annual_ss, pre_tax_ord, total_tax = 0, 0, 0, 0
+
         earned_income_me, earned_income_spouse = 0, 0
         match_income_by_owner = {"Me": 0, "Spouse": 0, "Joint": 0}
 
@@ -908,8 +1116,9 @@ def run_simulation(mkt_sequence, ctx_input):
                 owner_age = my_current_age if owner in ['Me', 'Joint'] else spouse_current_age
                 owner_alive = is_my_alive if owner in ['Me', 'Joint'] else is_spouse_alive
                 owner_rmd_age = ctx['primary_rmd_age'] if owner in ['Me', 'Joint'] else ctx['spouse_rmd_age']
+                # --- FIX: Cap age at 120 to prevent divisor fallback for extreme life expectancies ---
                 if owner_alive and owner_age >= owner_rmd_age:
-                    rmd_amt = a['bal'] / IRS_UNIFORM_TABLE.get(owner_age, 2.0)
+                    rmd_amt = a['bal'] / IRS_UNIFORM_TABLE.get(min(owner_age, 120), 2.0)
                     a['bal'] -= rmd_amt
                     rmd_income += rmd_amt
                     pre_tax_ord += rmd_amt
@@ -938,26 +1147,26 @@ def run_simulation(mkt_sequence, ctx_input):
 
                 if cat_name == "Social Security":
                     if owner == "Me":
-                        if is_my_alive:
-                            offset = max(0, year - int(primary_ss_start_year))
-                            primary_ss_entitlement = (base_amt * primary_ss_multi) * ((1 + ctx['infl'] / 100) ** offset)
-                            primary_ss_frozen_val = primary_ss_entitlement
-                        else:
-                            primary_ss_entitlement = primary_ss_frozen_val
+                        # --- FIX: Calculate SS continuously so survivor inherits an inflation-adjusted benefit, even if primary dies early ---
+                        offset = max(0, year - int(primary_ss_start_year))
+                        primary_ss_entitlement = (base_amt * primary_ss_multi) * ((1 + ctx['infl'] / 100) ** offset)
+                        primary_ss_frozen_val = primary_ss_entitlement
                     elif owner == "Spouse":
-                        if is_spouse_alive:
-                            offset = max(0, year - int(spouse_ss_start_year))
-                            spouse_ss_entitlement = (base_amt * spouse_ss_multi) * ((1 + ctx['infl'] / 100) ** offset)
-                            spouse_ss_frozen_val = spouse_ss_entitlement
-                        else:
-                            spouse_ss_entitlement = spouse_ss_frozen_val
+                        offset = max(0, year - int(spouse_ss_start_year))
+                        spouse_ss_entitlement = (base_amt * spouse_ss_multi) * ((1 + ctx['infl'] / 100) ** offset)
+                        spouse_ss_frozen_val = spouse_ss_entitlement
                     continue
 
                 if not is_active:
                     continue
 
                 g = safe_num(inc.get('Override Growth (%)'), ctx['inc_g'])
-                offset_for_growth = max(0, year - max(int(start_year), ctx['current_year']))
+                
+                # --- FIX: Unlock Historical & Future Compounding ---
+                # Removes the current_year clamp so past start dates correctly inflate 
+                # to their present-day value, and future start dates compound normally.
+                offset_for_growth = max(0, year - int(start_year))
+                
                 amt = base_amt * ((1 + g / 100) ** offset_for_growth)
 
                 if cat_name == "Employer Match (401k/HSA)":
@@ -997,10 +1206,11 @@ def run_simulation(mkt_sequence, ctx_input):
                         ss_started_spouse = True
             elif ctx['has_spouse'] and not is_spouse_alive:
                 if year >= primary_ss_start_year:
-                    benefit = max(primary_ss_entitlement, spouse_ss_entitlement)
+                    # --- FIX: Compare against frozen/persisted values for deceased spouse ---
+                    benefit = max(primary_ss_entitlement, spouse_ss_frozen_val)
                     active_ss += benefit
                     if not ss_started_me:
-                        desc = "📈 Survivor SS Begins" if spouse_ss_entitlement > primary_ss_entitlement else "📈 Social Security Begins (You)"
+                        desc = "📈 Survivor SS Begins" if spouse_ss_frozen_val > primary_ss_entitlement else "📈 Social Security Begins (You)"
                         if year not in milestones_by_year: milestones_by_year[year] = []
                         milestones_by_year[year].append({"desc": desc, "amt": benefit, "type": "system"})
                         ss_started_me = True
@@ -1013,10 +1223,11 @@ def run_simulation(mkt_sequence, ctx_input):
                         ss_started_me = True
         elif is_spouse_alive and not is_my_alive:
             if year >= spouse_ss_start_year:
-                benefit = max(primary_ss_entitlement, spouse_ss_entitlement)
+                # --- FIX: Compare against frozen/persisted values for deceased primary ---
+                benefit = max(primary_ss_frozen_val, spouse_ss_entitlement)
                 active_ss += benefit
                 if not ss_started_spouse:
-                    desc = "📈 Survivor SS Begins" if primary_ss_entitlement > spouse_ss_entitlement else "📈 Social Security Begins (Spouse)"
+                    desc = "📈 Survivor SS Begins" if primary_ss_frozen_val > spouse_ss_entitlement else "📈 Social Security Begins (Spouse)"
                     if year not in milestones_by_year: milestones_by_year[year] = []
                     milestones_by_year[year].append({"desc": desc, "amt": benefit, "type": "system"})
                     ss_started_spouse = True
@@ -1146,23 +1357,40 @@ def run_simulation(mkt_sequence, ctx_input):
 
         for a in sim_assets:
             o_acct = a.get('Owner', 'Me')
-            o_birth = ctx['my_birth_year'] if o_acct in ['Me', 'Joint'] else ctx['spouse_birth_year']
-            o_ret = ctx['primary_retire_year'] if o_acct in ['Me', 'Joint'] else ctx['spouse_retire_year']
-            o_alive = is_my_alive if o_acct in ['Me', 'Joint'] else is_spouse_alive
+            
+            # --- FIX: Symmetric Joint Account Handling ---
+            if o_acct == 'Joint':
+                o_alive = is_my_alive or is_spouse_alive
+                # If only one is alive, base retirement/catch-up rules on the survivor
+                o_birth = ctx['my_birth_year'] if is_my_alive else ctx['spouse_birth_year']
+                o_ret = ctx['primary_retire_year'] if is_my_alive else ctx['spouse_retire_year']
+            elif o_acct == 'Spouse':
+                o_alive = is_spouse_alive
+                o_birth = ctx['spouse_birth_year']
+                o_ret = ctx['spouse_retire_year']
+            else:
+                o_alive = is_my_alive
+                o_birth = ctx['my_birth_year']
+                o_ret = ctx['primary_retire_year']
+
             added_this_year = 0
 
             if o_alive and not (a.get('stop_at_ret', True) and year >= o_ret):
                 added_this_year = a['contrib']
-                if a.get('Type') in ['Traditional 401(k)', 'Traditional 401k/IRA', 'Roth 401(k)', 'Roth 401k/IRA']:
-                    limit = plan_401k_limit + (catchup_401k if (year - o_birth) >= 50 else 0)
-                    added_this_year = min(added_this_year, max(0, limit - person_401k_contribs[o_acct]))
-                    person_401k_contribs[o_acct] += added_this_year
-                elif a.get('Type') in ['Traditional IRA', 'Roth IRA']:
-                    limit = ira_limit + (catchup_ira if (year - o_birth) >= 50 else 0)
-                    added_this_year = min(added_this_year, limit)
-                user_out_of_pocket_contribs += added_this_year
+                
+                # --- FIX: Realistic Widowhood Adjustments ---
+                # Cut joint out-of-pocket savings in half to reflect single-income household
+                if o_acct == 'Joint' and ctx['has_spouse']:
+                    if (is_my_alive and not is_spouse_alive) or (is_spouse_alive and not is_my_alive):
+                        added_this_year *= 0.5
+                        
+                        # Log it once to the timeline so the user isn't confused
+                        if not a.get('widow_reduced_logged'):
+                            if year not in milestones_by_year: milestones_by_year[year] = []
+                            milestones_by_year[year].append({"desc": f"📉 Joint Savings Halved (Widowhood): {a.get('Account Name', 'Account')}", "amt": 0, "type": "system"})
+                            a['widow_reduced_logged'] = True
 
-                if a.get('Type') in ['Traditional 401(k)', 'Traditional 401k/IRA', 'Traditional IRA', 'HSA']:
+                if a.get('Type') in ['Traditional 401(k)', 'Traditional 401k/IRA', 'Roth 401(k)', 'Roth 401k/IRA']:
                     pre_tax_deductions += added_this_year
 
             a['approved_oop_contrib'] = added_this_year
@@ -1171,14 +1399,10 @@ def run_simulation(mkt_sequence, ctx_input):
 
         # --- LOGGING BRACKETS FOR UI ---
         infl_factor_tax = (1 + ctx['infl'] / 100) ** year_offset
-        std_deduction_ui = (29200 if active_mfj else 14600) * infl_factor_tax
+        std_deduction_ui = (STD_DEDUCTION["MFJ"] if active_mfj else STD_DEDUCTION["Single"]) * infl_factor_tax
         yd["Tax: 0% Limit (Std Ded)"] = std_deduction_ui
-        b_lims_ui = {
-            "12%": 94300 if active_mfj else 47150,
-            "22%": 201050 if active_mfj else 100525,
-            "24%": 383900 if active_mfj else 191950,
-            "32%": 487450 if active_mfj else 243725
-        }
+        
+        b_lims_ui = ROTH_TARGET_LIMITS["MFJ"] if active_mfj else ROTH_TARGET_LIMITS["Single"]
         yd["Tax: 12% Limit"] = b_lims_ui["12%"] * infl_factor_tax + std_deduction_ui
         yd["Tax: 22% Limit"] = b_lims_ui["22%"] * infl_factor_tax + std_deduction_ui
         yd["Tax: 24% Limit"] = b_lims_ui["24%"] * infl_factor_tax + std_deduction_ui
@@ -1274,8 +1498,9 @@ def run_simulation(mkt_sequence, ctx_input):
                                 if amount_to_cover <= 0: break
 
                     if covered_by_529 > 0:
-                        annual_inc += covered_by_529
-                        yd[f"Income: Tax-Free 529 Withdrawal ({desc})"] = covered_by_529
+                        # --- FIX 2: Categorize as Asset Drawdown, not Organic Salary ---
+                        total_withdrawals += covered_by_529
+                        yd[f"Income: Withdrawal (529 Plan for {desc})"] = covered_by_529
 
         if ctx['medicare_gap'] and is_retired and my_current_age < 65:
             income_factor = min(1.0, max(0.0, pre_tax_ord / 100000.0))
@@ -1320,10 +1545,12 @@ def run_simulation(mkt_sequence, ctx_input):
         total_converted = 0
         if ctx['roth_conversions'] and is_retired:
             infl_factor = (1 + ctx['infl'] / 100) ** year_offset
-            std_deduction = (29200 if active_mfj else 14600) * infl_factor
-            b_limits = {"12%": 94300, "22%": 201050, "24%": 383900, "32%": 487450} if active_mfj else {"12%": 47150, "22%": 100525, "24%": 191950, "32%": 243725}
-            target_limit = b_limits.get(ctx['roth_target'], 383900) * infl_factor + std_deduction
-
+            std_deduction = (STD_DEDUCTION["MFJ"] if active_mfj else STD_DEDUCTION["Single"]) * infl_factor
+            
+            # Pull limits dynamically from config
+            b_limits = ROTH_TARGET_LIMITS["MFJ"] if active_mfj else ROTH_TARGET_LIMITS["Single"]
+            target_limit = b_limits.get(ctx['roth_target'], 394600) * infl_factor + std_deduction
+            
             conversion_room = max(0, target_limit - tax_base_ord_pre)
             available_cash = sum(a['bal'] for a in sim_assets if a.get('Type') in ['Checking/Savings', 'HYSA', 'Brokerage (Taxable)', 'Unallocated Cash'])
             locked_outflows = total_exp + user_out_of_pocket_contribs + base_fed_tax_pre_conversion + base_state_tax_pre_conversion
@@ -1342,22 +1569,23 @@ def run_simulation(mkt_sequence, ctx_input):
                             a['bal'] -= convert
                             total_converted += convert
 
-                            # --- FIX: EXACT TAX DELTA CALCULATION ---
-                            base_fed, _ = calc_federal_tax(tax_base_ord_pre, active_mfj, year_offset, ctx['infl'])
-                            base_state = tax_base_ord_pre * (state_tax_rate / 100.0)
+                            # --- FIX: Cumulative Tax Delta Calculation ---
+                            # Calculate exactly how much extra tax this specific chunk generated
+                            # by comparing the cumulative total against the previous step.
+                            prev_tax_base = tax_base_ord_pre + (total_converted - convert)
+                            proposed_tax_base = tax_base_ord_pre + total_converted
                             
-                            proposed_tax_base = tax_base_ord_pre + convert
+                            prev_fed, _ = calc_federal_tax(prev_tax_base, active_mfj, year_offset, ctx['infl'])
                             prop_fed, _ = calc_federal_tax(proposed_tax_base, active_mfj, year_offset, ctx['infl'])
+                            
+                            prev_state = prev_tax_base * (state_tax_rate / 100.0)
                             prop_state = proposed_tax_base * (state_tax_rate / 100.0)
                             
-                            tax_cost = (prop_fed + prop_state) - (base_fed + base_state)
+                            tax_cost = (prop_fed + prop_state) - (prev_fed + prev_state)
                             
-                            # --- FIX: Track Roth taxes, but wait to log them to prevent double-counting ---
-                            roth_fed_tax_paid += (prop_fed - base_fed)
-                            roth_state_tax_paid += (prop_state - base_state)
-                            
-                            yd["Tax Breakdown: Federal"] = yd.get("Tax Breakdown: Federal", 0) + (prop_fed - base_fed)
-                            yd["Tax Breakdown: State"] = yd.get("Tax Breakdown: State", 0) + (prop_state - base_state)
+                            # Track Roth taxes for the UI
+                            roth_fed_tax_paid += (prop_fed - prev_fed)
+                            roth_state_tax_paid += (prop_state - prev_state)
 
                             for ca in sim_assets:
                                 if tax_cost <= 0: break
@@ -1395,8 +1623,10 @@ def run_simulation(mkt_sequence, ctx_input):
                 pre_tax_ord += total_converted
                 yd["Roth Conversion Amount"] = total_converted
 
-        final_qbi = get_qbi(pre_tax_ord)
-        tax_base_ord = max(0, pre_tax_ord - final_qbi - pre_tax_deductions)
+        # --- FIX: Isolate QBI from Roth Conversions ---
+        # Lock in the QBI deduction based strictly on operating baseline, 
+        # preventing voluntary Roth conversions from triggering a phase-out penalty.
+        tax_base_ord = max(0, pre_tax_ord - pre_conversion_qbi - pre_tax_deductions)
 
         # --- FIX: Smart Asset-Class Volatility Routing (Cash Crash Immunity) ---
         for a in sim_assets:
@@ -1422,17 +1652,36 @@ def run_simulation(mkt_sequence, ctx_input):
                 mc_sequence_year = mkt_sequence[year_offset]
                 actual_growth = mc_sequence_year + (asset_baseline_g - ctx.get('mkt', 7.0))
                 
-                # Apply Glidepath (if enabled) to de-risk investments in retirement
-                if ctx.get('glidepath', True) and is_retired:
+                # --- FIX: Smart Glidepath (Insulates Bonds & Fixed Income) ---
+                # Only de-risk equity-heavy accounts (defined as having a baseline expected growth > 4.0%)
+                if ctx.get('glidepath', True) and is_retired and asset_baseline_g > 4.0:
                     years_in_ret = year - ctx['primary_retire_year']
-                    glide_reduction = min(3.0, years_in_ret * 0.2)
+                    
+                    # Target a maximum 3% reduction over 15 years
+                    target_reduction = min(3.0, years_in_ret * 0.2)
+                    
+                    # Safety Floor: Never reduce an asset's expected baseline yield below 3.0% (Bond Proxy)
+                    max_safe_reduction = asset_baseline_g - 3.0
+                    glide_reduction = min(target_reduction, max_safe_reduction)
+                    
                     actual_growth -= glide_reduction
 
             # 5. Apply the compounding math (Mid-Year Convention for contributions)
             a['bal'] = (a['bal'] + (add + match) * 0.5) * (1 + actual_growth / 100.0) + (add + match) * 0.5
 
-        base_fed_tax, marginal_rate = calc_federal_tax(tax_base_ord, active_mfj, year_offset, ctx['infl'])
-        state_tax = tax_base_ord * (state_tax_rate / 100.0)
+        # --- FIX: Calculate absolute final taxes BEFORE and AFTER the Roth conversion ---
+        # 1. Baseline tax if the Roth conversion never happened (using tax_base_ord_pre)
+        base_fed_tax, _ = calc_federal_tax(tax_base_ord_pre, active_mfj, year_offset, ctx['infl'])
+        base_state_tax = tax_base_ord_pre * (state_tax_rate / 100.0)
+
+        # 2. Total tax including the Roth conversion and final QBI (using tax_base_ord)
+        total_fed_tax, marginal_rate = calc_federal_tax(tax_base_ord, active_mfj, year_offset, ctx['infl'])
+        total_state_tax = tax_base_ord * (state_tax_rate / 100.0)
+
+        # 3. The true cost of the Roth conversion is strictly the mathematical delta
+        actual_roth_fed = max(0, total_fed_tax - base_fed_tax)
+        actual_roth_state = max(0, total_state_tax - base_state_tax)
+
         fica_tax = 0
         wage_base = SS_WAGE_BASE_2026 * ((1 + ctx['infl'] / 100) ** year_offset)
         
@@ -1451,80 +1700,92 @@ def run_simulation(mkt_sequence, ctx_input):
         if combined_earned_income > addl_med_thresh:
             fica_tax += (combined_earned_income - addl_med_thresh) * 0.009
 
-        total_tax = base_fed_tax + state_tax + fica_tax
+        # Total tax paid out of pocket this year uses the total (post-conversion) numbers
+        total_tax = total_fed_tax + total_state_tax + fica_tax
         yd["Expense: Taxes"] = yd.get("Expense: Taxes", 0) + total_tax
         
-        # --- FIX: Explicitly separate baseline taxes from Roth Conversion taxes ---
-        yd["Tax Breakdown: Federal"] = yd.get("Tax Breakdown: Federal", 0) + max(0, base_fed_tax - roth_fed_tax_paid)
-        yd["Tax Breakdown: State"] = yd.get("Tax Breakdown: State", 0) + max(0, state_tax - roth_state_tax_paid)
-        yd["Tax Breakdown: Roth Conversion"] = yd.get("Tax Breakdown: Roth Conversion", 0) + (roth_fed_tax_paid + roth_state_tax_paid)
+        # --- FIX: Log the baseline taxes and the Roth delta perfectly without double-counting ---
+        yd["Tax Breakdown: Federal"] = yd.get("Tax Breakdown: Federal", 0) + base_fed_tax
+        yd["Tax Breakdown: State"] = yd.get("Tax Breakdown: State", 0) + base_state_tax
+        yd["Tax Breakdown: Roth Conversion"] = yd.get("Tax Breakdown: Roth Conversion", 0) + (actual_roth_fed + actual_roth_state)
         yd["Tax Breakdown: FICA"] = yd.get("Tax Breakdown: FICA", 0) + fica_tax
 
-        num_medicare = (1 if is_my_alive and my_current_age >= 65 else 0) + (
-            1 if is_spouse_alive and spouse_current_age >= 65 else 0)
-        if num_medicare > 0:
-            magi_for_irmaa = pre_tax_ord
-            infl_f = (1 + ctx['infl'] / 100) ** year_offset
-            t1, t2, t3, t4, t5 = 103000 * infl_f * (2 if active_mfj else 1), 129000 * infl_f * (2 if active_mfj else 1), 161000 * infl_f * (2 if active_mfj else 1), 193000 * infl_f * (2 if active_mfj else 1), 500000 * infl_f * (1.5 if active_mfj else 1)
-            surcharge = 0
-            if magi_for_irmaa > t5:
-                surcharge = 6500 * infl_f
-            elif magi_for_irmaa > t4:
-                surcharge = 5500 * infl_f
-            elif magi_for_irmaa > t3:
-                surcharge = 4000 * infl_f
-            elif magi_for_irmaa > t2:
-                surcharge = 2500 * infl_f
-            elif magi_for_irmaa > t1:
-                surcharge = 1000 * infl_f
-            if surcharge > 0:
-                total_irmaa = surcharge * num_medicare
-                total_exp += total_irmaa
-                yd["Expense: Medicare IRMAA Surcharge"] = total_irmaa
-                if not irmaa_triggered:
-                    if year not in milestones_by_year: milestones_by_year[year] = []
-                    milestones_by_year[year].append({"desc": "📉 Medicare IRMAA Surcharge Triggered", "amt": total_irmaa, "type": "system"})
-                    irmaa_triggered = True
-                if total_irmaa > last_irmaa_tier + 500:
-                    if year not in milestones_by_year: milestones_by_year[year] = []
-                    milestones_by_year[year].append({"desc": "📉 Medicare IRMAA Surcharge Tier Jumped", "amt": total_irmaa, "type": "system"})
-                    last_irmaa_tier = total_irmaa
+        # --- FIX: Baseline IRMAA Cost Lock-In ---
+        # Calculate Medicare surcharges before Roth optimization so the engine 
+        # doesn't accidentally spend required living capital on voluntary taxes.
+        num_medicare = (1 if is_my_alive and my_current_age >= 65 else 0) + (1 if is_spouse_alive and spouse_current_age >= 65 else 0)
+        baseline_irmaa = get_irmaa_surcharge(tax_base_ord_pre, active_mfj, year_offset, ctx['infl'], num_medicare)
+        
+        if baseline_irmaa > 0:
+            total_exp += baseline_irmaa
+            yd["Expense: Medicare IRMAA Surcharge"] = baseline_irmaa
+        # --- FIX: Post-Roth IRMAA Penalty Trap & Milestone Tracking ---
+        final_irmaa = get_irmaa_surcharge(pre_tax_ord, active_mfj, year_offset, ctx['infl'], num_medicare)
+        
+        # If the Roth conversion actively pushed us into a higher penalty tier, log the delta
+        irmaa_penalty_jump = final_irmaa - baseline_irmaa
+        if irmaa_penalty_jump > 0:
+            total_exp += irmaa_penalty_jump
+            yd["Expense: Medicare IRMAA Surcharge"] = yd.get("Expense: Medicare IRMAA Surcharge", 0) + irmaa_penalty_jump
+            
+            if year not in milestones_by_year: milestones_by_year[year] = []
+            milestones_by_year[year].append({"desc": "📉 Roth Conversion Triggered IRMAA Penalty", "amt": irmaa_penalty_jump, "type": "system"})
+
+        # Milestone tracking for UI
+        if final_irmaa > 0:
+            if not irmaa_triggered:
+                if year not in milestones_by_year: milestones_by_year[year] = []
+                milestones_by_year[year].append({"desc": "📉 Medicare IRMAA Surcharge Triggered", "amt": final_irmaa, "type": "system"})
+                irmaa_triggered = True
+            if final_irmaa > last_irmaa_tier + 500:
+                if year not in milestones_by_year: milestones_by_year[year] = []
+                milestones_by_year[year].append({"desc": "📉 Medicare IRMAA Tier Jumped", "amt": final_irmaa, "type": "system"})
+                last_irmaa_tier = final_irmaa
 
         if user_out_of_pocket_contribs > 0:
             yd["Expense: Portfolio Contributions"] = user_out_of_pocket_contribs
 
-        organic_cash_outflows = total_exp + user_out_of_pocket_contribs + yd["Expense: Taxes"]
+        # --- FIX 3: Clean Cash Flow Accounting ---
+        organic_cash_outflows = total_exp + user_out_of_pocket_contribs + yd.get("Expense: Taxes", 0)
+        
+        # Organic Net is strictly Income minus Outflows (Will correctly dip negative during college)
         organic_net_cash_flow = annual_inc - organic_cash_outflows
         yd["Organic Net Savings"] = organic_net_cash_flow
 
-        total_withdrawals = 0
+        # Effective cash flow is the actual remainder AFTER 529 assets were withdrawn to help
+        effective_net_cash_flow = organic_net_cash_flow + total_withdrawals
 
-        if organic_net_cash_flow > 0:
-            yd["Expense: Surplus Reinvested"] = organic_net_cash_flow
+        if effective_net_cash_flow > 0:
+            yd["Expense: Surplus Reinvested"] = effective_net_cash_flow
             if unfunded_debt_bal > 0:
-                payoff = min(organic_net_cash_flow, unfunded_debt_bal)
+                payoff = min(effective_net_cash_flow, unfunded_debt_bal)
                 unfunded_debt_bal -= payoff
-                organic_net_cash_flow -= payoff
-            if organic_net_cash_flow > 0 and sim_assets:
+                effective_net_cash_flow -= payoff
+            
+            if effective_net_cash_flow > 0 and sim_assets:
                 taxable_acct = next((a for a in sim_assets if a.get('Type') == 'Brokerage (Taxable)'), None)
                 if not taxable_acct:
                     taxable_acct = next((a for a in sim_assets if a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash']), None)
 
                 if taxable_acct:
-                    taxable_acct['bal'] += organic_net_cash_flow
+                    taxable_acct['bal'] += effective_net_cash_flow
                 else:
                     new_cash_acct = {"Account Name": "Unallocated Cash", "Type": "Checking/Savings", "Owner": "Me",
-                                     "bal": organic_net_cash_flow, "contrib": 0.0, "growth": 0.0, "stop_at_ret": False}
+                                     "bal": effective_net_cash_flow, "contrib": 0.0, "growth": 0.0, "stop_at_ret": False}
                     sim_assets.append(new_cash_acct)
 
-        elif organic_net_cash_flow < 0:
-            shortfall = abs(organic_net_cash_flow)
+        elif effective_net_cash_flow < 0:
+            shortfall = abs(effective_net_cash_flow)
+            
+            # --- FIX: Insulate Shortfall Withdrawals from Roth Tax Spikes ---
+            # Pass tax_base_ord_pre and marginal_rate_pre_conversion to all _withdraw calls
+            # so necessary emergency withdrawals aren't penalized by voluntary conversions.
 
             for a in sim_assets:
                 if shortfall <= 0: break
                 if a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash']:
                     shortfall, t_inc, wd = _withdraw(a, shortfall, 'free', ctx, my_current_age, spouse_current_age,
-                                                     active_mfj, year_offset, tax_base_ord, marginal_rate, state_tax_rate, year, yd)
+                                                     active_mfj, year_offset, tax_base_ord_pre, marginal_rate_pre_conversion, state_tax_rate, year, yd)
                     total_withdrawals += wd
 
             if shortfall > 0 and not cash_depleted and not any(a['bal'] > 0 for a in sim_assets if a.get('Type') in ['Checking/Savings', 'HYSA', 'Unallocated Cash']):
@@ -1536,7 +1797,7 @@ def run_simulation(mkt_sequence, ctx_input):
                 if shortfall <= 0: break
                 if a.get('Type') == 'Brokerage (Taxable)':
                     shortfall, t_inc, wd = _withdraw(a, shortfall, 'cg', ctx, my_current_age, spouse_current_age,
-                                                     active_mfj, year_offset, tax_base_ord, marginal_rate, state_tax_rate, year, yd)
+                                                     active_mfj, year_offset, tax_base_ord_pre, marginal_rate_pre_conversion, state_tax_rate, year, yd)
                     yd["Expense: Taxes"] = yd.get("Expense: Taxes", 0) + t_inc
                     yd["Tax Breakdown: Withdrawals"] = yd.get("Tax Breakdown: Withdrawals", 0) + t_inc
                     total_withdrawals += wd
@@ -1563,7 +1824,7 @@ def run_simulation(mkt_sequence, ctx_input):
 
                         shortfall, t_inc, wd = _withdraw(a, shortfall, 'ordinary' if is_trad else 'free', ctx,
                                                          my_current_age, spouse_current_age, active_mfj, year_offset,
-                                                         tax_base_ord, marginal_rate, state_tax_rate, year, yd)
+                                                         tax_base_ord_pre, marginal_rate_pre_conversion, state_tax_rate, year, yd)
                         yd["Expense: Taxes"] = yd.get("Expense: Taxes", 0) + t_inc
                         yd["Tax Breakdown: Withdrawals"] = yd.get("Tax Breakdown: Withdrawals", 0) + t_inc
                         total_withdrawals += wd
@@ -1573,8 +1834,8 @@ def run_simulation(mkt_sequence, ctx_input):
                     if shortfall <= 0: break
                     if a['bal'] > 0 and a.get('Type') not in ['Checking/Savings', 'HYSA', 'Unallocated Cash', 'Brokerage (Taxable)'] + trad_types + tax_free_types:
                         shortfall, t_inc, wd = _withdraw(a, shortfall, 'ordinary', ctx, my_current_age,
-                                                         spouse_current_age, active_mfj, year_offset, tax_base_ord,
-                                                         marginal_rate, state_tax_rate, year, yd)
+                                                         spouse_current_age, active_mfj, year_offset, tax_base_ord_pre,
+                                                         marginal_rate_pre_conversion, state_tax_rate, year, yd)
                         yd["Expense: Taxes"] = yd.get("Expense: Taxes", 0) + t_inc
                         yd["Tax Breakdown: Withdrawals"] = yd.get("Tax Breakdown: Withdrawals", 0) + t_inc
                         total_withdrawals += wd
@@ -1618,9 +1879,9 @@ def run_simulation(mkt_sequence, ctx_input):
     return sim_res, det_res, nw_det_res, milestones_by_year
 
 @st.cache_data(show_spinner=False)
-def execute_sim_engine_v8(mkt_sequence_tuple, ctx_json):
+def execute_sim_engine_v8(mkt_sequence_tuple, ctx_hash, _ctx_json):
     # Deserialize the string back into a dict for the engine
-    ctx = json.loads(ctx_json)
+    ctx = json.loads(_ctx_json)
     s_res, d_res, nw_res, milestones = run_simulation(list(mkt_sequence_tuple), ctx)
     return pd.DataFrame(s_res), pd.DataFrame(d_res).fillna(0), pd.DataFrame(nw_res).fillna(0), milestones
 
@@ -1642,44 +1903,44 @@ def render_dashboard():
                 f"<div class='card' style='text-align:center; padding:24px 16px; margin-bottom: 12px; border-color: {'#10b981' if status['profile'] else '#e2e8f0'};'><div style='font-size:2.5rem; margin-bottom:12px;'>👤</div><h4 style='margin:0 0 4px 0; font-size:1.1rem;'>1. Basic Info</h4><p style='font-size:0.85rem; color:#64748b; margin:0;'>Age & timeline.</p></div>",
                 unsafe_allow_html=True)
             if not status['profile']:
-                if st.button("Start Step", key="ob_prof", type="primary", use_container_width=True):
+                if st.button("Start Step", key="ob_prof", type="primary", width='stretch'):
                     st.session_state['current_page'] = "👤 Profile & Family"
                     st.rerun()
             else:
-                st.button("✅ Completed", key="ob_prof_done", disabled=True, use_container_width=True)
+                st.button("✅ Completed", key="ob_prof_done", disabled=True, width='stretch')
 
         with c2:
             st.markdown(
                 f"<div class='card' style='text-align:center; padding:24px 16px; margin-bottom: 12px; border-color: {'#10b981' if status['income'] else '#e2e8f0'};'><div style='font-size:2.5rem; margin-bottom:12px;'>💵</div><h4 style='margin:0 0 4px 0; font-size:1.1rem;'>2. Income</h4><p style='font-size:0.85rem; color:#64748b; margin:0;'>Salaries & SS.</p></div>",
                 unsafe_allow_html=True)
             if not status['income']:
-                if st.button("Add Income", key="ob_inc", type="primary", use_container_width=True):
+                if st.button("Add Income", key="ob_inc", type="primary", width='stretch'):
                     st.session_state['current_page'] = "💵 Income Streams"
                     st.rerun()
             else:
-                st.button("✅ Completed", key="ob_inc_done", disabled=True, use_container_width=True)
+                st.button("✅ Completed", key="ob_inc_done", disabled=True, width='stretch')
 
         with c3:
             st.markdown(
                 f"<div class='card' style='text-align:center; padding:24px 16px; margin-bottom: 12px; border-color: {'#10b981' if status['assets'] else '#e2e8f0'};'><div style='font-size:2.5rem; margin-bottom:12px;'>🏦</div><h4 style='margin:0 0 4px 0; font-size:1.1rem;'>3. Assets</h4><p style='font-size:0.85rem; color:#64748b; margin:0;'>Real estate & 401(k).</p></div>",
                 unsafe_allow_html=True)
             if not status['assets']:
-                if st.button("Add Assets", key="ob_ast", type="primary", use_container_width=True):
+                if st.button("Add Assets", key="ob_ast", type="primary", width='stretch'):
                     st.session_state['current_page'] = "🏦 Assets & Debts"
                     st.rerun()
             else:
-                st.button("✅ Completed", key="ob_ast_done", disabled=True, use_container_width=True)
+                st.button("✅ Completed", key="ob_ast_done", disabled=True, width='stretch')
 
         with c4:
             st.markdown(
                 f"<div class='card' style='text-align:center; padding:24px 16px; margin-bottom: 12px; border-color: {'#10b981' if status['expenses'] else '#e2e8f0'};'><div style='font-size:2.5rem; margin-bottom:12px;'>💸</div><h4 style='margin:0 0 4px 0; font-size:1.1rem;'>4. Cash Flows</h4><p style='font-size:0.85rem; color:#64748b; margin:0;'>Budgets & goals.</p></div>",
                 unsafe_allow_html=True)
             if not status['expenses']:
-                if st.button("Add Expenses", key="ob_exp", type="primary", use_container_width=True):
+                if st.button("Add Expenses", key="ob_exp", type="primary", width='stretch'):
                     st.session_state['current_page'] = "💸 Cash Flows"
                     st.rerun()
             else:
-                st.button("✅ Completed", key="ob_exp_done", disabled=True, use_container_width=True)
+                st.button("✅ Completed", key="ob_exp_done", disabled=True, width='stretch')
         st.divider()
 
     section_header("Executive Summary", "Your complete financial trajectory at a glance.", "🏠")
@@ -1695,18 +1956,52 @@ def render_dashboard():
         st.warning("Your Life Expectancy must be greater than your Current Age to run the simulation.")
         return
 
-    with st.spinner("Running high-precision simulation engine..."):
+    # --- FIX: The Frontend Render Flush ---
+    with st.spinner("⚙️ Compiling Financial Blueprint..."):
+        time.sleep(0.05) # Forces the server to draw the spinner before locking the CPU
+        
         mkt_seq = tuple([sim_ctx['mkt']] * (sim_ctx['max_years'] + 1))
         
-        # --- FIX: Serialize sim_ctx to JSON to match the new high-speed cache wrapper ---
-        df_sim_nominal, df_det_nominal, df_nw_nominal, run_milestones = execute_sim_engine_v8(mkt_seq, json.dumps(sim_ctx))
+        clean_ctx = sanitize_for_cache(sim_ctx)
+        ctx_json = json.dumps(clean_ctx, sort_keys=True)
+        ctx_hash = hashlib.md5(ctx_json.encode('utf-8')).hexdigest()
+        
+        df_sim_nominal, df_det_nominal, df_nw_nominal, run_milestones = execute_sim_engine_v8(mkt_seq, ctx_hash, ctx_json)
         
         st.session_state['df_sim_nominal'] = df_sim_nominal
         st.session_state['df_det'] = df_det_nominal
         st.session_state['df_nw'] = df_nw_nominal
 
     if df_sim_nominal.empty:
-        st.error("Simulation returned no data. Please check your profile and start dates.")
+        st.markdown(
+            """
+            <div style='text-align:center; padding:60px 24px; background:#f8fafc; border-radius:16px; border:2px dashed #cbd5e1; margin-top: 20px; margin-bottom:24px;'>
+                <div style='font-size:3.5rem; margin-bottom:16px;'>🌱</div>
+                <h3 style='color:#0f172a; margin:0 0 12px; font-weight: 800; font-size: 1.8rem;'>Your Blueprint is a Blank Canvas</h3>
+                <p style='color:#64748b; margin:0 auto 32px; font-size:1.1rem; max-width: 600px; line-height: 1.6;'>
+                    The simulation engine is ready, but it needs a bit more data to project your future net worth. Add your current financial foundation to bring your dashboard to life.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        
+        # --- FIX: Inject direct routing CTAs so the user isn't stranded ---
+        st.write("#### What would you like to add first?")
+        cta1, cta2, cta3 = st.columns(3)
+        
+        if cta1.button("💵 Add Income Sources", type="primary", width='stretch'):
+            st.session_state['current_page'] = "💵 Income Streams"
+            st.rerun()
+            
+        if cta2.button("🏦 Add Savings & Assets", type="primary", width='stretch'):
+            st.session_state['current_page'] = "🏦 Assets & Debts"
+            st.rerun()
+            
+        if cta3.button("💸 Estimate Living Expenses", type="primary", width='stretch'):
+            st.session_state['current_page'] = "💸 Cash Flows"
+            st.rerun()
+            
         return
 
     df_sim = df_sim_nominal.copy()
@@ -1796,15 +2091,22 @@ def render_dashboard():
                                                               'Surplus Reinvested'] else 'rgba(244, 63, 94, 0.4)')
 
     if total_inflow > 0 and HAS_PLOTLY:
+        # --- FIX: Dynamic UI Scaling for Sankey Heights ---
+        # Calculate exactly how many items are currently active on the screen
+        num_nodes = len(inflows) + len(outflows) + 1
+        
+        # Give each node 60px of breathing room, capped between 400px and 1200px
+        dynamic_height = max(400, min(1200, num_nodes * 60))
+
         fig_sankey = go.Figure(data=[go.Sankey(arrangement="snap",
                                                node=dict(pad=35, thickness=30, line=dict(color="black", width=0.5),
                                                          label=labels, color=node_colors),
                                                textfont=dict(color="black", size=12),
                                                link=dict(source=source, target=target, value=value,
                                                          color=link_colors))])
-        fig_sankey.update_layout(height=900, margin=dict(l=0, r=0, t=30, b=50), font=dict(size=12))
-        st.plotly_chart(fig_sankey, use_container_width=True)
-
+                                                         
+        fig_sankey.update_layout(height=dynamic_height, margin=dict(l=0, r=0, t=30, b=50), font=dict(size=12))
+        st.plotly_chart(fig_sankey, width='stretch')
 
 def render_profile():
     section_header("Profile & Family Context",
@@ -1889,9 +2191,9 @@ def render_income():
             "Annual Amount ($)": st.column_config.NumberColumn("Amount per Year ($)", step=1000, format="$%d"),
             "Start Year": st.column_config.NumberColumn("Start Year", min_value=1900, max_value=2100, format="%d"),
             "End Year": st.column_config.NumberColumn("End Year", min_value=1900, max_value=2100, format="%d"),
-            "Stop at Ret.?": st.column_config.CheckboxColumn("Stop at Retirement?"),
-            "Override Growth (%)": st.column_config.NumberColumn("Custom Growth (%)", step=0.1, format="%.1f%%")
-        }, num_rows="dynamic", use_container_width=True, key="inc_editor", on_change=mark_dirty
+            "Stop at Ret.?": st.column_config.CheckboxColumn("Stop at Retirement?", help="If checked, this income permanently stops the year the owner retires."),
+            "Override Growth (%)": st.column_config.NumberColumn("Custom Growth (%)", step=0.1, format="%.1f%%", help="Overrides the default income growth rate. Leave blank to use the global assumption.")
+        }, num_rows="dynamic", width='stretch', key="inc_editor"
     )
     
     # --- FIX: Extract records and scrub NaN values to prevent infinite st.rerun() loops ---
@@ -1910,54 +2212,82 @@ def render_income():
                 elif safe_num(s_yr) > b_yr + 70:
                     st.error(f"🚨 Social Security '{html.escape(str(inc.get('Description', 'Unknown')))}': Delayed retirement credits max out at age 70 (Year {b_yr + 70}). The simulation engine will cap this.")
 
-    # --- FIX: Immediate State Commit ---
-    # We compare the JSON strings to ignore Python dict object identity mismatches
-    if json.dumps(edited_inc_records) != json.dumps(scrub_records(st.session_state.get('income_data', []))):
-        st.session_state['income_data'] = edited_inc_records
+    # --- FIX: Bulletproof State Commit ---
+    if sync_editor_state('income_data', edited_inc_records):
         st.rerun()
 
-    render_total("Total Pre-Tax Income", edited_inc['Annual Amount ($)'])
+    # --- FIX: Premium Income Summary Metrics ---
+    st.divider()
+    total_inc_val = pd.to_numeric(edited_inc['Annual Amount ($)'], errors='coerce').fillna(0).sum()
+    
+    # Calculate an estimated monthly net
+    # 1. Grab assumptions
+    asm = st.session_state.get('assumptions', {})
+    state_tax_rate = float(asm.get('current_tax_rate', 5.0)) / 100.0
+    is_mfj = st.session_state.get('has_spouse', False)
+    
+    # 2. Get quick federal estimate (Year 0 offset)
+    fed_tax_est, _ = calc_federal_tax(total_inc_val, is_mfj, 0, float(asm.get('inflation', 3.0)))
+    state_tax_est = total_inc_val * state_tax_rate
+    
+    # 3. Final monthly net calculation
+    annual_net = total_inc_val - fed_tax_est - state_tax_est
+    monthly_net = annual_net / 12.0
 
-    # --- FIX: Safe AI State Machine ---
+    met_col1, met_col2, met_col3 = st.columns([1, 1, 2]) 
+    with met_col1:
+        st.metric("Total Annual (Gross)", f"${total_inc_val:,.0f}", 
+                  help="Total pre-tax income from all sources.")
+    
+    with met_col2:
+        # Show monthly net with a helpful tooltip about the math
+        st.metric("Monthly Net (Est.)", f"${monthly_net:,.0f}", 
+                  help=f"Estimated take-home pay after Federal and {asm.get('current_tax_rate', 5.0)}% State tax assumptions.")
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # --- FIX: AI State & API Key Guard ---
+    ai_disabled = st.session_state.get('ai_loading', False) or not GEMINI_API_KEY
+    tooltip = "⚠️ Gemini API Key missing in secrets.toml" if not GEMINI_API_KEY else "Use AI to estimate your benefit based on age and income"
+
     col_ai_inc, _ = st.columns([3, 1])
     with col_ai_inc:
-        if st.button("✨ Auto-Estimate My Social Security (AI)", type="primary", use_container_width=True):
+        if st.button("✨ Auto-Estimate My Social Security (AI)", type="primary", width='stretch', disabled=ai_disabled, help=tooltip):
             st.session_state['trigger_ss_ai'] = True
+            st.session_state['ai_loading'] = True
+            st.rerun()
 
     if st.session_state.get('trigger_ss_ai'):
-        if check_ai_rate_limit():
-            try:
+        rate_limit_hit = False # Track if we actually hit the wall
+        try:
+            # FIX: Rate limit check moved INSIDE the try/finally so it clears properly if it fails
+            if check_ai_rate_limit():
                 with st.spinner("Asking AI to estimate your Social Security benefits based on your age and income..."):
-                    spouse_age = relativedelta(datetime.date.today(), st.session_state.get('spouse_dob',
-                                                                                           datetime.date(1982, 1,
-                                                                                                         1))).years if st.session_state.get(
-                        'has_spouse') else 0
+                    spouse_age = relativedelta(datetime.date.today(), st.session_state.get('spouse_dob', datetime.date(1982, 1, 1))).years if st.session_state.get('has_spouse') else 0
                     curr_inc = pd.to_numeric(edited_inc['Annual Amount ($)'], errors='coerce').fillna(0).sum()
                     if st.session_state.get('has_spouse'):
                         prompt = f"User is {my_age} years old making ${curr_inc}/year. Spouse is {spouse_age} years old. Estimate realistic annual Social Security primary insurance amounts (PIA) at Full Retirement Age for both. Return JSON: {{'ss_amount_me': integer, 'ss_amount_spouse': integer}}"
                     else:
                         prompt = f"User is {my_age} years old making ${curr_inc}/year. Estimate their annual Social Security primary insurance amount (PIA) at Full Retirement Age. Return JSON: {{'ss_amount_me': integer}}"
+                    
                     res = call_gemini_json(prompt)
                     if res:
-                        current_inc = [row for row in edited_inc.to_dict('records') if
-                                       row.get("Category") != "Social Security"]
+                        current_inc = [row for row in edited_inc.to_dict('records') if row.get("Category") != "Social Security"]
                         my_birth_year = st.session_state.get('my_dob', datetime.date(1980, 1, 1)).year
-                        spouse_birth_year = st.session_state.get('spouse_dob', datetime.date(1982, 1,
-                                                                                             1)).year if st.session_state.get(
-                            'has_spouse') else current_year
-                        if 'ss_amount_me' in res: current_inc.append(
-                            {"Description": "Estimated Social Security (Primary)", "Category": "Social Security",
-                             "Owner": "Me", "Annual Amount ($)": res['ss_amount_me'], "Start Year": my_birth_year + 67,
-                             "End Year": 2100, "Stop at Ret.?": False, "Override Growth (%)": None})
-                        if 'ss_amount_spouse' in res and st.session_state.get('has_spouse'): current_inc.append(
-                            {"Description": "Estimated Social Security (Spouse)", "Category": "Social Security",
-                             "Owner": "Spouse", "Annual Amount ($)": res['ss_amount_spouse'],
-                             "Start Year": spouse_birth_year + 67, "End Year": 2100, "Stop at Ret.?": False,
-                             "Override Growth (%)": None})
+                        spouse_birth_year = st.session_state.get('spouse_dob', datetime.date(1982, 1, 1)).year if st.session_state.get('has_spouse') else current_year
+                        
+                        if 'ss_amount_me' in res: current_inc.append({"Description": "Estimated Social Security (Primary)", "Category": "Social Security", "Owner": "Me", "Annual Amount ($)": res['ss_amount_me'], "Start Year": my_birth_year + 67, "End Year": 2100, "Stop at Ret.?": False, "Override Growth (%)": None})
+                        if 'ss_amount_spouse' in res and st.session_state.get('has_spouse'): current_inc.append({"Description": "Estimated Social Security (Spouse)", "Category": "Social Security", "Owner": "Spouse", "Annual Amount ($)": res['ss_amount_spouse'], "Start Year": spouse_birth_year + 67, "End Year": 2100, "Stop at Ret.?": False, "Override Growth (%)": None})
+                        
                         st.session_state['income_data'] = current_inc
                         mark_dirty()
-            finally:
-                st.session_state['trigger_ss_ai'] = False
+        finally:
+            st.session_state['trigger_ss_ai'] = False
+            st.session_state['ai_loading'] = False
+            # --- FIX: Only force an immediate rerun if we actually did work ---
+            # If rate_limit_hit is True, we skip the rerun. 
+            # This allows the st.warning() from check_ai_rate_limit to actually stay on the screen.
+            if not rate_limit_hit:
                 st.rerun()
 
 
@@ -1965,13 +2295,13 @@ def render_assets():
     section_header("Assets, Debts & Net Worth",
                    "Construct your balance sheet. The AI draws down these buckets dynamically.", "🏦")
 
+    tab_re, tab_biz, tab_ast, tab_debt = st.tabs(
+        ["🏢 Real Estate", "💼 Business Interests", "🏦 Liquid Assets", "💳 Debts & Loans"])
+    
     edited_re = pd.DataFrame()
     edited_biz = pd.DataFrame()
     edited_ast = pd.DataFrame()
     edited_debt = pd.DataFrame()
-
-    tab_re, tab_biz, tab_ast, tab_debt = st.tabs(
-        ["🏢 Real Estate", "💼 Business Interests", "🏦 Liquid Assets", "💳 Debts & Loans"])
 
     with tab_re:
         info_banner(
@@ -1995,19 +2325,21 @@ def render_assets():
                           "Override Prop Growth (%)", "Override Rent Growth (%)"],
             column_config={
                 "Property Name": st.column_config.TextColumn("Property Name"),
-                "Is Primary Residence?": st.column_config.CheckboxColumn("Primary Home?", default=False),
+                "Is Primary Residence?": st.column_config.CheckboxColumn("Primary Home?", default=False, help="Check if you live here. Its expenses will be counted as living costs instead of business deductions."),
                 "Market Value ($)": st.column_config.NumberColumn("Market Value ($)", step=10000, format="$%d"),
                 "Mortgage Balance ($)": st.column_config.NumberColumn("Mortgage Balance ($)", step=10000, format="$%d"),
                 "Interest Rate (%)": st.column_config.NumberColumn("Interest Rate (%)", step=0.001, format="%.3f%%"),
-                "Mortgage Payment ($)": st.column_config.NumberColumn("Monthly P&I ($)", step=100, format="$%d"),
-                "Monthly Expenses ($)": st.column_config.NumberColumn("Taxes/Ins/HOA ($)", step=100, format="$%d"),
+                "Mortgage Payment ($)": st.column_config.NumberColumn("Monthly P&I ($)", step=100, format="$%d", help="Principal and Interest only. The engine amortizes this to zero automatically."),
+                "Monthly Expenses ($)": st.column_config.NumberColumn("Taxes/Ins/HOA ($)", step=100, format="$%d", help="Include property taxes, insurance, and HOA. Do not include the mortgage payment."),
                 "Monthly Rent ($)": st.column_config.NumberColumn("Monthly Rent ($)", step=100, format="$%d"),
-                "Override Prop Growth (%)": st.column_config.NumberColumn("Property Growth (%)", step=0.1,
-                                                                          format="%.1f%%"),
-                "Override Rent Growth (%)": st.column_config.NumberColumn("Rent Growth (%)", step=0.1, format="%.1f%%")
-            }, num_rows="dynamic", use_container_width=True, key="re_editor", on_change=mark_dirty
+                "Override Prop Growth (%)": st.column_config.NumberColumn("Property Growth (%)", step=0.1, format="%.1f%%", help="Custom annual appreciation rate for this property. Leave blank to use the global assumption."),
+                "Override Rent Growth (%)": st.column_config.NumberColumn("Rent Growth (%)", step=0.1, format="%.1f%%", help="Custom annual rent increase rate. Leave blank to use the global assumption.")
+            }, num_rows="dynamic", width='stretch', key="re_editor"
         )
-        st.session_state['real_estate_data'] = edited_re.to_dict('records')
+        # --- FIX: Bulletproof State Commit ---
+        scrubbed_re = scrub_records(edited_re.to_dict('records'))
+        if sync_editor_state('real_estate_data', scrubbed_re):
+            st.rerun()
 
     with tab_biz:
         df_biz = pd.DataFrame(st.session_state.get('business_data', []))
@@ -2029,15 +2361,15 @@ def render_assets():
             column_config={
                 "Total Valuation ($)": st.column_config.NumberColumn("Total Value ($)", step=10000, format="$%d"),
                 "Annual Distribution ($)": st.column_config.NumberColumn("Annual Income ($)", step=1000, format="$%d"),
-                "Your Ownership (%)": st.column_config.NumberColumn("Your Ownership (%)", min_value=0, max_value=100,
-                                                                    format="%d%%"),
-                "Override Val. Growth (%)": st.column_config.NumberColumn("Value Growth (%)", step=0.1,
-                                                                          format="%.1f%%"),
-                "Override Dist. Growth (%)": st.column_config.NumberColumn("Income Growth (%)", step=0.1,
-                                                                           format="%.1f%%")
-            }, num_rows="dynamic", use_container_width=True, key="biz_editor", on_change=mark_dirty
+                "Your Ownership (%)": st.column_config.NumberColumn("Your Ownership (%)", min_value=0, max_value=100, format="%d%%"),
+                "Override Val. Growth (%)": st.column_config.NumberColumn("Value Growth (%)", step=0.1, format="%.1f%%", help="Custom annual valuation growth. Leave blank to use global market growth."),
+                "Override Dist. Growth (%)": st.column_config.NumberColumn("Income Growth (%)", step=0.1, format="%.1f%%", help="Custom annual income distribution growth. Leave blank to use global income growth.")
+            }, num_rows="dynamic", width='stretch', key="biz_editor"
         )
-        st.session_state['business_data'] = edited_biz.to_dict('records')
+        # --- FIX: Bulletproof State Commit ---
+        scrubbed_biz = scrub_records(edited_biz.to_dict('records'))
+        if sync_editor_state('business_data', scrubbed_biz):
+            st.rerun()
 
     with tab_ast:
         info_banner(
@@ -2062,20 +2394,18 @@ def render_assets():
             column_order=["Account Name", "Type", "Owner", "Current Balance ($)", "Annual Contribution ($/yr)",
                           "Est. Annual Growth (%)", "Stop Contrib at Ret.?"],
             column_config={
-                "Type": st.column_config.SelectboxColumn("Account Type",
-                                                         options=["Checking/Savings", "HYSA", "Brokerage (Taxable)",
-                                                                  "Traditional 401(k)", "Traditional IRA",
-                                                                  "Roth 401(k)", "Roth IRA", "HSA", "Crypto",
-                                                                  "529 Plan", "Other"]),
+                "Type": st.column_config.SelectboxColumn("Account Type", options=["Checking/Savings", "HYSA", "Brokerage (Taxable)", "Traditional 401(k)", "Traditional IRA", "Roth 401(k)", "Roth IRA", "HSA", "Crypto", "529 Plan", "Other"], help="Dictates exactly how this account is taxed upon withdrawal."),
                 "Owner": st.column_config.SelectboxColumn("Whose Account?", options=["Me", "Spouse", "Joint"]),
                 "Current Balance ($)": st.column_config.NumberColumn("Current Balance ($)", step=5000, format="$%d"),
-                "Annual Contribution ($/yr)": st.column_config.NumberColumn("Your Contributions ($/yr)", step=1000,
-                                                                            format="$%d"),
-                "Est. Annual Growth (%)": st.column_config.NumberColumn("Custom Return (%)", format="%.1f%%"),
-                "Stop Contrib at Ret.?": st.column_config.CheckboxColumn("Stop Adding at Ret.?")
-            }, num_rows="dynamic", use_container_width=True, key="assets_editor", on_change=mark_dirty
+                "Annual Contribution ($/yr)": st.column_config.NumberColumn("Your Contributions ($/yr)", step=1000, format="$%d", help="Your out-of-pocket additions. Exclude employer matches, the AI routes those automatically."),
+                "Est. Annual Growth (%)": st.column_config.NumberColumn("Custom Return (%)", format="%.1f%%", help="Custom annual return for this account. Leave blank to use global market growth."),
+                "Stop Contrib at Ret.?": st.column_config.CheckboxColumn("Stop Adding at Ret.?", help="If checked, contributions cease the year the owner retires.")
+            }, num_rows="dynamic", width='stretch', key="assets_editor"
         )
-        st.session_state['liquid_assets_data'] = edited_ast.to_dict('records')
+        # --- FIX: Bulletproof State Commit ---
+        scrubbed_ast = scrub_records(edited_ast.to_dict('records'))
+        if sync_editor_state('liquid_assets_data', scrubbed_ast):
+            st.rerun()
 
     with tab_debt:
         info_banner(
@@ -2095,9 +2425,12 @@ def render_assets():
                 "Current Balance ($)": st.column_config.NumberColumn("Current Balance ($)", step=1000, format="$%d"),
                 "Interest Rate (%)": st.column_config.NumberColumn("Interest Rate (%)", step=0.001, format="%.3f%%"),
                 "Monthly Payment ($)": st.column_config.NumberColumn("Monthly Payment ($)", step=100, format="$%d")
-            }, num_rows="dynamic", use_container_width=True, key="debt_editor", on_change=mark_dirty
+            }, num_rows="dynamic", width='stretch', key="debt_editor"
         )
-        st.session_state['liabilities_data'] = edited_debt.to_dict('records')
+        # --- FIX: Bulletproof State Commit ---
+        scrubbed_debt = scrub_records(edited_debt.to_dict('records'))
+        if sync_editor_state('liabilities_data', scrubbed_debt):
+            st.rerun()
 
     re_eq = pd.to_numeric(edited_re['Market Value ($)'], errors='coerce').fillna(0).sum() - pd.to_numeric(
         edited_re['Mortgage Balance ($)'], errors='coerce').fillna(0).sum() if not edited_re.empty else 0
@@ -2118,6 +2451,10 @@ def render_assets():
 
 
 def render_cashflows():
+    # --- FIX: Reset the AI confirmation gate whenever this page is freshly loaded ---
+    # This prevents the warning from appearing automatically if the user navigated away mid-confirmation.
+    st.session_state.pop('confirm_budget_overwrite', None)
+    
     section_header("Lifetime Cash Flows", "Map out budgets and milestones. Do not double-count housing or debt.", "💸")
     info_banner(
         "Healthcare Note: Assume you are covered by employer-sponsored healthcare while working. The engine automatically builds in Pre-Medicare gaps, Medicare premium cliffs at age 65, and IRMAA surcharges.")
@@ -2131,6 +2468,9 @@ def render_cashflows():
         ret_city_flow = city_autocomplete("Retirement City (Optional)", "retire_city_flow",
                                           default_val=st.session_state.get('retire_city_flow', ''))
         st.session_state['retire_city_flow'] = ret_city_flow
+
+    # --- FIX: Set clear user expectations regarding the physics engine vs AI ---
+    st.caption("*(Note: City locations are used by the Fiduciary AI to estimate localized budgets. To apply actual tax rate changes, visit **Simulation → Macro Assumptions**).*")
 
     st.divider()
     df_exp = pd.DataFrame(st.session_state.get('lifetime_expenses', []))
@@ -2153,56 +2493,80 @@ def render_cashflows():
             "Category": st.column_config.SelectboxColumn("Category", options=BUDGET_CATEGORIES),
             "Frequency": st.column_config.SelectboxColumn("Frequency", options=["Monthly", "Yearly", "One-Time"]),
             "Amount ($)": st.column_config.NumberColumn("Amount ($)", step=100, format="$%d"),
-            "Start Phase": st.column_config.SelectboxColumn("Starts", options=["Now", "At Retirement", "Custom Year"]),
-            "Start Year": st.column_config.NumberColumn("Start Year (If Custom)", format="%d", min_value=1900,
-                                                        max_value=2100),
-            "End Phase": st.column_config.SelectboxColumn("Ends",
-                                                          options=["End of Life", "At Retirement", "Custom Year"]),
-            "End Year": st.column_config.NumberColumn("End Year (If Custom)", format="%d", min_value=1900,
-                                                      max_value=2100),
-            "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI?")
-        }, num_rows="dynamic", use_container_width=True, key="exp_ed", on_change=mark_dirty
+            "Start Phase": st.column_config.SelectboxColumn("Starts", options=["Now", "At Retirement", "Custom Year"], help="When this expense begins in your timeline."),
+            "Start Year": st.column_config.NumberColumn("Start Year (If Custom)", format="%d", min_value=1900, max_value=2100),
+            "End Phase": st.column_config.SelectboxColumn("Ends", options=["End of Life", "At Retirement", "Custom Year"], help="When this expense permanently stops in your timeline."),
+            "End Year": st.column_config.NumberColumn("End Year (If Custom)", format="%d", min_value=1900, max_value=2100),
+            "AI Estimate?": st.column_config.CheckboxColumn("🤖 AI?", help="Indicates this row was generated by the AI based on your location and profile.")
+        }, num_rows="dynamic", width='stretch', key="exp_ed"
     )
-    st.session_state['lifetime_expenses'] = edited_exp.to_dict('records')
+    # --- FIX: Scrub NaN values to protect AI prompt integrity and prevent cache busting ---
+    edited_exp_records = scrub_records(edited_exp.to_dict('records'))
+    
+    # --- FIX: Bulletproof State Commit ---
+    edited_exp_records = scrub_records(edited_exp.to_dict('records'))
+    if sync_editor_state('lifetime_expenses', edited_exp_records):
+        st.rerun()
 
-    # --- FIX: Safe AI State Machine ---
+    # --- FIX: AI State & API Key Guard ---
+    ai_disabled = st.session_state.get('ai_loading', False) or not GEMINI_API_KEY
+    tooltip = "⚠️ Gemini API Key missing in secrets.toml" if not GEMINI_API_KEY else "Auto-generate realistic expenses based on your city and family size"
+
     col_ai_cb, _ = st.columns([3, 1])
+    
+    # Count how many rows are currently marked as AI-generated
+    ai_row_count = len([x for x in st.session_state.get('lifetime_expenses', []) if x.get('AI Estimate?')])
+
     with col_ai_cb:
-        if st.button("✨ Auto-Estimate Budget & Milestones for selected locations (AI)", type="primary",
-                     use_container_width=True):
-            st.session_state['trigger_budget_ai'] = True
+        if not st.session_state.get('confirm_budget_overwrite', False):
+            # Step 1: Initial Trigger
+            if st.button("✨ Auto-Estimate Budget & Milestones (AI)", type="primary", width='stretch', disabled=ai_disabled, help=tooltip):
+                if ai_row_count > 0:
+                    st.session_state['confirm_budget_overwrite'] = True
+                    st.rerun()
+                else:
+                    # If no AI rows exist, just skip the warning and trigger immediately
+                    st.session_state['trigger_budget_ai'] = True
+                    st.session_state['ai_loading'] = True
+                    st.rerun()
+        else:
+            # Step 2: Confirmation Warning
+            st.warning(f"⚠️ This will overwrite {ai_row_count} existing AI-generated rows. Your manually entered rows (where AI? is unchecked) will be safe.")
+            c1, c2 = st.columns(2)
+            if c1.button("✅ Confirm Overwrite", type="primary", width='stretch'):
+                st.session_state['confirm_budget_overwrite'] = False
+                st.session_state['trigger_budget_ai'] = True
+                st.session_state['ai_loading'] = True
+                st.rerun()
+            if c2.button("❌ Cancel", width='stretch'):
+                st.session_state['confirm_budget_overwrite'] = False
+                st.rerun()
+
+    # The rest of your 'if st.session_state.get('trigger_budget_ai'):' block remains the same...
 
     if st.session_state.get('trigger_budget_ai'):
-        if check_ai_rate_limit():
-            try:
+        try:
+            if check_ai_rate_limit():
                 with st.spinner("Analyzing localized CPI data, timelines, and family needs..."):
                     valid = edited_exp[edited_exp["Description"].astype(str) != ""].copy()
                     locked = valid[valid["AI Estimate?"] == False].to_dict('records')
-                    locked_desc = [x['Description'] for x in locked]
+                    # --- FIX: Sanitize user-typed descriptions before passing to AI ---
+                    locked_desc = sanitize_for_ai([x['Description'] for x in locked])
 
                     current_year = datetime.date.today().year
-                    my_age = relativedelta(datetime.date.today(),
-                                           st.session_state.get('my_dob', datetime.date(1980, 1, 1))).years
-                    spouse_age = relativedelta(datetime.date.today(), st.session_state.get('spouse_dob',
-                                                                                           datetime.date(1982, 1,
-                                                                                                         1))).years if st.session_state.get(
-                        'has_spouse') else 0
+                    my_age = relativedelta(datetime.date.today(), st.session_state.get('my_dob', datetime.date(1980, 1, 1))).years
+                    spouse_age = relativedelta(datetime.date.today(), st.session_state.get('spouse_dob', datetime.date(1982, 1, 1))).years if st.session_state.get('has_spouse') else 0
                     k_ctx_list = [f"{k['name']}:{k['age']}" for k in st.session_state.get('kids_data', [])]
                     k_ctx_str = ", ".join(k_ctx_list)
-                    f_ctx = f"User({my_age})" + (
-                        f", Spouse({st.session_state.get('spouse_name', '')}:{spouse_age})" if st.session_state.get(
-                            'has_spouse') else "") + f", Dependents({k_ctx_str})"
+                    f_ctx = f"User({my_age})" + (f", Spouse({st.session_state.get('spouse_name', '')}:{spouse_age})" if st.session_state.get('has_spouse') else "") + f", Dependents({k_ctx_str})"
 
                     df_inc = pd.DataFrame(st.session_state.get('income_data', []))
-                    curr_inc_total = pd.to_numeric(df_inc['Annual Amount ($)'], errors='coerce').fillna(
-                        0).sum() if not df_inc.empty else 0
+                    curr_inc_total = pd.to_numeric(df_inc['Annual Amount ($)'], errors='coerce').fillna(0).sum() if not df_inc.empty else 0
                     df_ast = pd.DataFrame(st.session_state.get('liquid_assets_data', []))
-                    liq_ast_total = pd.to_numeric(df_ast['Current Balance ($)'], errors='coerce').fillna(
-                        0).sum() if not df_ast.empty else 0
+                    liq_ast_total = pd.to_numeric(df_ast['Current Balance ($)'], errors='coerce').fillna(0).sum() if not df_ast.empty else 0
 
                     df_re = pd.DataFrame(st.session_state.get('real_estate_data', []))
-                    primary_re = df_re[df_re[
-                                           "Is Primary Residence?"] == True] if not df_re.empty and "Is Primary Residence?" in df_re.columns else pd.DataFrame()
+                    primary_re = df_re[df_re["Is Primary Residence?"] == True] if not df_re.empty and "Is Primary Residence?" in df_re.columns else pd.DataFrame()
                     owns_home = not primary_re.empty
 
                     curr_city_flow_clean = re.sub(r'[^a-zA-Z0-9, ]', '', str(curr_city_flow))[:100]
@@ -2216,13 +2580,15 @@ def render_cashflows():
                     wealth_ctx = f"The household has a current annual pre-tax income of ${curr_inc_total:,.0f} and liquid assets totaling ${liq_ast_total:,.0f}. VERY IMPORTANT: assume these users are savvy spenders."
                     allowed_cats = ", ".join(BUDGET_CATEGORIES)
                     prompt = f"Current City: {curr_city_flow_clean}. Planned Retirement City: {ret_city_flow_clean}. Family: {f_ctx}. Current Year is {current_year}. {wealth_ctx} Generate a comprehensive list of missing living expenses AND expected future life milestones. {ai_exclusion} Skip these items: {json.dumps(locked_desc)}. Return ONLY a JSON array of objects with keys: 'Description', 'Category' (MUST be exactly one of: {allowed_cats}), 'Frequency' (Monthly/Yearly/One-Time), 'Amount ($)' (number), 'Start Phase' (Now/At Retirement/Custom Year), 'Start Year' (integer or null), 'End Phase' (End of Life/At Retirement/Custom Year), 'End Year' (integer or null), and 'AI Estimate?' (true)."
+                    
                     res = call_gemini_json(prompt)
                     if res and isinstance(res, list) and len(res) > 0:
                         st.session_state['lifetime_expenses'] = locked + res
                         mark_dirty()
-            finally:
-                st.session_state['trigger_budget_ai'] = False
-                st.rerun()
+        finally:
+            st.session_state['trigger_budget_ai'] = False
+            st.session_state['ai_loading'] = False
+            st.rerun()
 
     st.divider()
     pre_ret_monthly = 0
@@ -2249,13 +2615,18 @@ def render_cashflows():
 def render_simulation():
     section_header("Simulation", "Fine-tune your timeline and run Monte Carlo scenarios.", "📈")
 
-    def ai_number_input(label, state_key, prompt, col):
+    def ai_number_input(label, state_key, prompt, col, help_text=""):
+        # --- FIX: AI State & API Key Guard ---
+        ai_disabled = st.session_state.get('ai_loading', False) or not GEMINI_API_KEY
+        tooltip = "⚠️ Gemini API Key missing in secrets.toml" if not GEMINI_API_KEY else f"AI Estimate for {label}"
+        
         with col:
             sub_c1, sub_c2 = st.columns([5, 2])
             widget_key = f"in_{state_key}"
 
             val = sub_c1.number_input(label, step=0.1, key=widget_key,
-                                      value=float(st.session_state.get('assumptions', {}).get(state_key, 0.0)))
+                                      value=float(st.session_state.get('assumptions', {}).get(state_key, 0.0)),
+                                      help=help_text)
             if val != st.session_state.get('assumptions', {}).get(state_key):
                 new_assumptions = st.session_state.get('assumptions', {}).copy()
                 new_assumptions[state_key] = val
@@ -2263,13 +2634,16 @@ def render_simulation():
                 mark_dirty()
 
             sub_c2.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
-            if sub_c2.button("✨ AI", key=f"btn_{state_key}", help=f"AI Estimate for {label}", use_container_width=True,
-                             type="primary"):
+            
+            # Disable the button if ANY AI call is running OR the key is missing
+            if sub_c2.button("✨ AI", key=f"btn_{state_key}", help=tooltip, width='stretch', type="primary", disabled=ai_disabled):
                 st.session_state[f'trigger_ai_{state_key}'] = True
+                st.session_state['ai_loading'] = True
+                st.rerun()
 
             if st.session_state.get(f'trigger_ai_{state_key}'):
-                if check_ai_rate_limit():
-                    try:
+                try:
+                    if check_ai_rate_limit():
                         with st.spinner("AI estimating..."):
                             enhanced_prompt = prompt + " CRITICAL INSTRUCTION: You MUST return the value as a percentage number between 0 and 100 (e.g., return 5.5 for 5.5%, DO NOT return 0.055). Return ONLY a JSON object."
                             res = call_gemini_json(enhanced_prompt)
@@ -2280,10 +2654,11 @@ def render_simulation():
                                 new_assumptions[state_key] = new_val
                                 st.session_state['assumptions'] = new_assumptions
                                 mark_dirty()
-                    finally:
-                        st.session_state[f'trigger_ai_{state_key}'] = False
-                        st.rerun()
-            return val
+                finally:
+                    st.session_state[f'trigger_ai_{state_key}'] = False
+                    st.session_state['ai_loading'] = False
+                    st.rerun()
+        return val
 
     tab_ages, tab_assumptions, tab_stress = st.tabs(
         ["⏳ Timeline & Ages", "📊 Macro Assumptions", "🌪️ Stress Tests & Taxes"])
@@ -2294,88 +2669,72 @@ def render_simulation():
         'has_spouse') else 0
 
     with tab_ages:
-        cc1, cc2, cc3, cc4 = st.columns(4)
-        ret_age = cc1.slider("Retirement Age", max(int(my_age), 1), 100,
-                             max(int(my_age), int(st.session_state.get('ret_age', 65))), key="sld_ret_age")
-        s_ret_age = cc2.slider("Spouse Retire Age", max(int(spouse_age), 1), 100,
-                               max(int(spouse_age), int(st.session_state.get('s_ret_age', 65))),
-                               key="sld_s_ret_age") if st.session_state.get('has_spouse') else 65
-        my_life_exp = cc3.slider("Your Life Expectancy", max(70, ret_age), 115,
-                                 max(ret_age, int(st.session_state.get('my_life_exp', 95))), key="sld_life_exp")
-        spouse_life_exp = cc4.slider("Spouse Life Expectancy", max(70, s_ret_age), 115,
-                                     max(s_ret_age, int(st.session_state.get('spouse_life_exp', 95))),
-                                     key="sld_s_life_exp") if st.session_state.get('has_spouse') else 0
+        st.markdown("<div class='card' style='margin-bottom: 16px;'><h3 style='margin-top:0;'>Life Timeline Controls</h3><p style='color:#64748b; font-size:0.95rem; margin:0;'>Adjust your milestones here and click Apply to recalculate the blueprint.</p></div>", unsafe_allow_html=True)
+        
+        # --- FIX: Form Buffer prevents "stuttering" simulations while dragging sliders ---
+        with st.form("form_timeline", border=False):
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            
+            new_ret_age = cc1.slider("Retirement Age", min_value=max(int(my_age), 1), max_value=100,
+                                     value=max(int(my_age), int(st.session_state.get('ret_age', 65))))
+            
+            new_s_ret_age = cc2.slider("Spouse Retire Age", min_value=max(int(spouse_age), 1), max_value=100,
+                                       value=max(int(spouse_age), int(st.session_state.get('s_ret_age', 65)))) if st.session_state.get('has_spouse') else 65
+                                       
+            # Removed the dynamic min_value binding here so it doesn't break inside the static form
+            new_my_life_exp = cc3.slider("Your Life Expectancy", min_value=70, max_value=120,
+                                         value=int(st.session_state.get('my_life_exp', 95)))
+                                         
+            new_spouse_life_exp = cc4.slider("Spouse Life Expectancy", min_value=70, max_value=120,
+                                             value=int(st.session_state.get('spouse_life_exp', 95))) if st.session_state.get('has_spouse') else 0
 
-        if ret_age < my_age: info_banner("Retirement age cannot be lower than current age.", "warning")
-        if my_life_exp < ret_age: info_banner("Life expectancy cannot be lower than retirement age.", "warning")
+            submit_ages = st.form_submit_button("⚙️ Apply Timeline Changes", type="primary", use_container_width=True)
 
-        if st.session_state.get('ret_age') != ret_age: update_state('ret_age', ret_age)
-        if st.session_state.get('s_ret_age') != s_ret_age: update_state('s_ret_age', s_ret_age)
-        if st.session_state.get('my_life_exp') != my_life_exp: update_state('my_life_exp', my_life_exp)
-        if st.session_state.get('spouse_life_exp') != spouse_life_exp: update_state('spouse_life_exp', spouse_life_exp)
+            if submit_ages:
+                valid = True
+                if new_ret_age < my_age: 
+                    st.error(f"Retirement age ({new_ret_age}) cannot be lower than current age ({my_age}).")
+                    valid = False
+                if new_my_life_exp < new_ret_age: 
+                    st.error("Life expectancy cannot be lower than retirement age.")
+                    valid = False
+                    
+                if valid:
+                    st.session_state['ret_age'] = new_ret_age
+                    st.session_state['s_ret_age'] = new_s_ret_age
+                    st.session_state['my_life_exp'] = new_my_life_exp
+                    st.session_state['spouse_life_exp'] = new_spouse_life_exp
+                    mark_dirty()
+                    st.rerun()
 
     with tab_assumptions:
-        st.markdown(
-            "<div class='card' style='margin-bottom: 24px;'><h3 style='margin-top:0;'>Macroeconomic Assumptions</h3></div>",
-            unsafe_allow_html=True)
+        st.markdown("<div class='card' style='margin-bottom: 24px;'><h3 style='margin-top:0;'>Macroeconomic Assumptions</h3></div>", unsafe_allow_html=True)
         ac1, ac2, ac3 = st.columns(3)
-        mkt = ai_number_input("Market Growth (%)", 'market_growth',
-                              f"What is a realistic conservative long-term annual market growth rate for a diversified retirement portfolio? Return JSON: {{'market_growth': float}}",
-                              ac1)
-        infl = ai_number_input("General CPI Inflation (%)", 'inflation',
-                               f"What is the projected long-term average general US CPI inflation rate? Return JSON: {{'inflation': float}}",
-                               ac2)
-        inc_g = ai_number_input("Income Growth (%)", 'income_growth',
-                                f"What is a realistic annual salary growth/merit increase rate? Return JSON: {{'income_growth': float}}",
-                                ac3)
+        mkt = ai_number_input("Market Growth (%)", 'market_growth', f"What is a realistic conservative long-term annual market growth rate for a diversified retirement portfolio? Return JSON: {{'market_growth': float}}", ac1, help_text="Expected average annual return for your invested assets.")
+        infl = ai_number_input("General CPI Inflation (%)", 'inflation', f"What is the projected long-term average general US CPI inflation rate? Return JSON: {{'inflation': float}}", ac2, help_text="Expected annual increase in the cost of general goods.")
+        inc_g = ai_number_input("Income Growth (%)", 'income_growth', f"What is a realistic annual salary growth/merit increase rate? Return JSON: {{'income_growth': float}}", ac3, help_text="Expected annual increase in your salary or non-investment income.")
 
         ac4, ac5, ac6 = st.columns(3)
         curr_city_flow = st.session_state.get('curr_city_flow', '')
         curr_city_flow_clean = re.sub(r'[^a-zA-Z0-9, ]', '', str(curr_city_flow))[:100]
-        infl_hc = ai_number_input("Healthcare Inflation (%)", 'inflation_healthcare',
-                                  f"What is the projected long-term annual healthcare cost inflation rate in the US? Return JSON: {{'inflation_healthcare': float}}",
-                                  ac4)
-        infl_ed = ai_number_input("Education Inflation (%)", 'inflation_education',
-                                  f"What is the projected long-term annual college tuition inflation rate in the US? Return JSON: {{'inflation_education': float}}",
-                                  ac5)
-        prop_g = ai_number_input("Property Growth (%)", 'property_growth',
-                                 f"Historical average annual real estate appreciation rate for {curr_city_flow_clean}? Return JSON: {{'property_growth': float}}",
-                                 ac6)
+        infl_hc = ai_number_input("Healthcare Inflation (%)", 'inflation_healthcare', f"What is the projected long-term annual healthcare cost inflation rate in the US? Return JSON: {{'inflation_healthcare': float}}", ac4, help_text="Expected annual increase for medical expenses (historically higher than general inflation).")
+        infl_ed = ai_number_input("Education Inflation (%)", 'inflation_education', f"What is the projected long-term annual college tuition inflation rate in the US? Return JSON: {{'inflation_education': float}}", ac5, help_text="Expected annual increase for college tuition and education costs.")
+        prop_g = ai_number_input("Property Growth (%)", 'property_growth', f"Historical average annual real estate appreciation rate for {curr_city_flow_clean}? Return JSON: {{'property_growth': float}}", ac6, help_text="Expected annual appreciation of your real estate values.")
 
         ac7, ac8, ac9 = st.columns(3)
         ret_city_flow = st.session_state.get('retire_city_flow', '')
         ret_city_flow_clean = re.sub(r'[^a-zA-Z0-9, ]', '', str(ret_city_flow))[:100]
-        curr_inc_total = pd.to_numeric(pd.DataFrame(st.session_state.get('income_data', []))['Annual Amount ($)'],
-                                       errors='coerce').fillna(0).sum() if st.session_state.get('income_data') else 0
-        rent_g = ai_number_input("Rent Growth (%)", 'rent_growth',
-                                 f"Projected average annual rent increase rate for {curr_city_flow_clean}? Return JSON: {{'rent_growth': float}}",
-                                 ac7)
-        cur_t = ai_number_input(
-            "Current State Tax (%)", 
-            'current_tax_rate', 
-            f"User lives in {curr_city_flow_clean} with ${curr_inc_total:,.0f} income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'current_tax_rate': float}}", 
-            ac8
-        )
-        # Inject the UI warning immediately below the input
-        with ac8:
-            st.caption("*(Note: Applied to Fed AGI. If your state—like PA or NJ—does not allow 401k deductions, adjust this rate slightly higher.)*")
-
-        ret_t = ai_number_input(
-            "Retire State Tax (%)", 
-            'retire_tax_rate', 
-            f"User plans to retire in {ret_city_flow_clean} with estimated retirement income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'retire_tax_rate': float}}", 
-            ac9
-        )
+        curr_inc_total = pd.to_numeric(pd.DataFrame(st.session_state.get('income_data', []))['Annual Amount ($)'], errors='coerce').fillna(0).sum() if st.session_state.get('income_data') else 0
+        rent_g = ai_number_input("Rent Growth (%)", 'rent_growth', f"Projected average annual rent increase rate for {curr_city_flow_clean}? Return JSON: {{'rent_growth': float}}", ac7, help_text="Expected annual increase in rental income you receive.")
+        cur_t = ai_number_input("Current State Tax (%)", 'current_tax_rate', f"User lives in {curr_city_flow_clean} with ${curr_inc_total:,.0f} income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'current_tax_rate': float}}", ac8, help_text="Your estimated effective state and local tax rate while working.")
+        with ac8: st.caption("*(Note: Applied to Fed AGI. If your state does not allow 401k deductions, adjust slightly higher.)*")
+        ret_t = ai_number_input("Retire State Tax (%)", 'retire_tax_rate', f"User plans to retire in {ret_city_flow_clean} with estimated retirement income. Suggest effective STATE/LOCAL income tax rate ONLY. Return JSON: {{'retire_tax_rate': float}}", ac9, help_text="Your estimated effective state and local tax rate during retirement.")
 
         ac10, _, _ = st.columns(3)
-        shortfall_rate = ai_number_input("Shortfall Penalty/Borrowing Rate (%)", 'shortfall_rate',
-                                         f"What is a realistic personal loan or credit card interest rate for someone forced to borrow during retirement shortfalls? Return JSON: {{'shortfall_rate': float}}",
-                                         ac10)
+        shortfall_rate = ai_number_input("Shortfall Penalty/Borrowing Rate (%)", 'shortfall_rate', f"What is a realistic personal loan or credit card interest rate for someone forced to borrow during retirement shortfalls? Return JSON: {{'shortfall_rate': float}}", ac10, help_text="The interest rate charged on 'Unfunded Debt' if you run out of money and are forced to borrow to cover living expenses.")
 
     with tab_stress:
-        st.markdown(
-            "<div class='card' style='margin-bottom: 24px;'><h3 style='margin-top:0;'>Tax Engine & Stress Tests</h3></div>",
-            unsafe_allow_html=True)
+        st.markdown("<div class='card' style='margin-bottom: 24px;'><h3 style='margin-top:0;'>Tax Engine & Stress Tests</h3></div>", unsafe_allow_html=True)
         sc1, sc2 = st.columns(2)
 
         def update_asm_toggle(key, val):
@@ -2386,35 +2745,29 @@ def render_simulation():
                 mark_dirty()
 
         with sc1:
-            medicare_gap = st.toggle("🏥 Model Pre-Medicare Gap",
-                                     value=st.session_state.get('assumptions', {}).get('medicare_gap', True))
+            medicare_gap = st.toggle("🏥 Model Pre-Medicare Gap", value=st.session_state.get('assumptions', {}).get('medicare_gap', True), help="Adds a $15,000/yr proxy cost if you retire before Medicare kicks in at 65.", key="tgl_med_gap")
             update_asm_toggle('medicare_gap', medicare_gap)
-            medicare_cliff = st.toggle("🏥 Apply Medicare Cliff (Drop Healthcare at 65)",
-                                       value=st.session_state.get('assumptions', {}).get('medicare_cliff', True))
+            
+            medicare_cliff = st.toggle("🏥 Apply Medicare Cliff (Drop Healthcare at 65)", value=st.session_state.get('assumptions', {}).get('medicare_cliff', True), help="Reduces your general healthcare expense by 25% per person at age 65 to simulate Medicare taking over.", key="tgl_med_cliff")
             update_asm_toggle('medicare_cliff', medicare_cliff)
-            glidepath = st.toggle("📉 Apply Investment Glidepath",
-                                  value=st.session_state.get('assumptions', {}).get('glidepath', True))
+            
+            glidepath = st.toggle("📉 Apply Investment Glidepath", value=st.session_state.get('assumptions', {}).get('glidepath', True), help="Gradually reduces your investment growth rate by up to 3% in retirement to simulate shifting to safer assets (bonds).", key="tgl_glidepath")
             update_asm_toggle('glidepath', glidepath)
-            stress_test = st.toggle("📉 Apply -25% Market Crash at Retirement",
-                                    value=st.session_state.get('assumptions', {}).get('stress_test', False))
+            
+            stress_test = st.toggle("📉 Apply -25% Market Crash at Retirement", value=st.session_state.get('assumptions', {}).get('stress_test', False), help="Applies a severe market drop in your exact first year of retirement to test Sequence of Returns Risk.", key="tgl_stress_test")
             update_asm_toggle('stress_test', stress_test)
-            ltc_shock = st.toggle("🛏️ Long-Term Care (LTC) Shock",
-                                  value=st.session_state.get('assumptions', {}).get('ltc_shock', False))
+            
+            ltc_shock = st.toggle("🛏️ Long-Term Care (LTC) Shock", value=st.session_state.get('assumptions', {}).get('ltc_shock', False), help="Simulates a massive $100k+ annual expense in the final two years of life for nursing home care.", key="tgl_ltc")
             update_asm_toggle('ltc_shock', ltc_shock)
 
         with sc2:
-            active_withdrawal_strategy = st.selectbox("Shortfall Withdrawal Sequence",
-                                                      options=["Standard (Taxable -> 401k -> Roth)",
-                                                               "Roth Preferred (Taxable -> Roth -> 401k)"],
-                                                      index=0 if "Standard" in st.session_state.get('assumptions',
-                                                                                                    {}).get(
-                                                          'withdrawal_strategy', 'Standard') else 1)
-            roth_conversions = st.toggle("🔄 Enable Roth Conversion Optimizer",
-                                         value=st.session_state.get('assumptions', {}).get('roth_conversions', False))
-            roth_target_idx = ["12%", "22%", "24%", "32%"].index(
-                st.session_state.get('assumptions', {}).get('roth_target', "24%"))
-            roth_target = st.selectbox("Target Bracket to Fill", options=["12%", "22%", "24%", "32%"],
-                                       index=roth_target_idx)
+            active_withdrawal_strategy = st.selectbox("Shortfall Withdrawal Sequence", options=["Standard (Taxable -> 401k -> Roth)", "Roth Preferred (Taxable -> Roth -> 401k)"], index=0 if "Standard" in st.session_state.get('assumptions', {}).get('withdrawal_strategy', 'Standard') else 1, help="Standard drains Traditional accounts before Roth. Roth Preferred drains Roth before Traditional to keep taxable income artificially low.", key="sel_wd_strat")
+            
+            roth_conversions = st.toggle("🔄 Enable Roth Conversion Optimizer", value=st.session_state.get('assumptions', {}).get('roth_conversions', False), help="Automatically converts Traditional balances to Roth up to your target tax bracket during low-income years.", key="tgl_roth_conv")
+            
+            roth_target_idx = ["12%", "22%", "24%", "32%"].index(st.session_state.get('assumptions', {}).get('roth_target', "24%"))
+            roth_target = st.selectbox("Target Bracket to Fill", options=["12%", "22%", "24%", "32%"], index=roth_target_idx, help="The highest tax bracket you are willing to 'fill up' with Roth conversions each year.", key="sel_roth_target")
+            
             update_asm_toggle('roth_conversions', roth_conversions)
             update_asm_toggle('roth_target', roth_target)
             update_asm_toggle('withdrawal_strategy', active_withdrawal_strategy.split(' ')[0])
@@ -2430,10 +2783,17 @@ def render_simulation():
     elif sim_ctx['max_years'] <= 0:
         st.warning("Your Life Expectancy must be greater than your Current Age to run the simulation.")
     else:
-        mkt_seq = tuple([sim_ctx['mkt']] * (sim_ctx['max_years'] + 1))
+        # --- FIX: The Frontend Render Flush ---
+        with st.spinner("⚙️ Recalculating Matrix..."):
+            time.sleep(0.05) # Forces the server to draw the spinner before locking the CPU
+            
+            mkt_seq = tuple([sim_ctx['mkt']] * (sim_ctx['max_years'] + 1))
 
-        # --- FIX: Serialize context to guarantee stable, instant cache hits ---
-        df_sim_nominal, df_det_nominal, df_nw_nominal, run_milestones = execute_sim_engine_v8(mkt_seq, json.dumps(sim_ctx))
+            clean_ctx = sanitize_for_cache(sim_ctx)
+            ctx_json = json.dumps(clean_ctx, sort_keys=True)
+            ctx_hash = hashlib.md5(ctx_json.encode('utf-8')).hexdigest()
+            
+            df_sim_nominal, df_det_nominal, df_nw_nominal, run_milestones = execute_sim_engine_v8(mkt_seq, ctx_hash, ctx_json)
 
         if not df_sim_nominal.empty:
             df_sim, df_det, df_nw = df_sim_nominal.copy(), df_det_nominal.copy(), df_nw_nominal.copy()
@@ -2524,7 +2884,7 @@ def render_simulation():
 
                     fig_nw.update_layout(barmode='relative')
                     fig_nw = apply_chart_theme(fig_nw)
-                    st.plotly_chart(fig_nw, use_container_width=True)
+                    st.plotly_chart(fig_nw, width='stretch')
 
                     st.write("#### Annual Cash Flow & Progressive Taxes")
                     fig_cf = go.Figure()
@@ -2539,7 +2899,7 @@ def render_simulation():
                     if m_x_alert: fig_cf.add_trace(go.Scatter(x=m_x_alert, y=[0] * len(m_x_alert), mode='markers', marker=dict(symbol='star', size=18, color='#ef4444', line=dict(width=2, color='white')), name='Critical Alerts', hoverinfo='text', text=m_text_alert))
 
                     fig_cf = apply_chart_theme(fig_cf)
-                    st.plotly_chart(fig_cf, use_container_width=True)
+                    st.plotly_chart(fig_cf, width='stretch')
                 else:
                     st.info("Please install Plotly to view the charts.")
 
@@ -2547,11 +2907,16 @@ def render_simulation():
             with out_tab_sens:
                 st.markdown('<div class="info-text" style="margin-bottom: 20px;">💡 <strong>Tornado Chart (Sensitivity Analysis):</strong> This isolates your biggest risks by stress-testing key variables one at a time. It reveals which assumption moving slightly has the most drastic impact on your Final Net Worth.</div>', unsafe_allow_html=True)
                 
-                if st.button("✨ Run Sensitivity Analysis", type="primary", use_container_width=True, key="btn_sens"):
+                # --- FIX: Generate a deterministic hash of the CURRENT simulation context ---
+                # We reuse your excellent float scrubber to ensure no false-positive hash mismatches!
+                current_clean_ctx = sanitize_for_cache(sim_ctx)
+                current_ctx_json = json.dumps(current_clean_ctx, sort_keys=True)
+                current_ctx_hash = hash(current_ctx_json)
+                
+                if st.button("✨ Run Sensitivity Analysis", type="primary", width='stretch', key="btn_sens"):
                     with st.spinner("Running 10 divergent timelines to map risk..."):
                         base_nw_sens = final_nw
-                        
-                        base_ctx_json = json.dumps(sim_ctx)
+                        base_ctx_json = current_ctx_json # Use the sanitized JSON we just made!
                         
                         sens_scenarios = [
                             ("Market Returns", "mkt", -1.0, 1.0, "%"),
@@ -2561,56 +2926,80 @@ def render_simulation():
                             ("Real Estate Growth", "prop_g", -1.5, 1.5, "%")
                         ]
                         
-                        results = []
-                        for name, key, down_val, up_val, unit in sens_scenarios:
-                            def run_scenario(shift):
+                        # --- FIX: Direct Engine Call (Bypasses Cache Lock & Pandas Overhead) ---
+                        def run_scenario(shift, scenario_key):
                                 c = json.loads(base_ctx_json)
                                 
-                                if key == 'ret_age':
+                                if scenario_key == 'ret_age':
                                     c['primary_retire_year'] += int(shift)
                                     if c['has_spouse']: c['spouse_retire_year'] += int(shift)
-                                elif key == 'expenses':
+                                elif scenario_key == 'expenses':
                                     for e in c['exp_records']: 
-                                        e['Amount ($)'] = safe_num(e.get('Amount ($)')) * (1 + shift/100.0)
+                                        raw_amt = e.get('Amount ($)')
+                                        if raw_amt is not None and str(raw_amt).strip() != "":
+                                            e['Amount ($)'] = safe_num(raw_amt) * (1 + shift/100.0)
                                 else:
-                                    c[key] += shift
+                                    c[scenario_key] += shift
                                     
-                                m_seq = tuple([c['mkt']] * (c['max_years'] + 1))
-                                df_s, _, _, _ = execute_sim_engine_v8(m_seq, json.dumps(c))
-                                val = df_s.iloc[-1]['Net Worth'] if not df_s.empty else 0
+                                m_seq = list([c['mkt']] * (c['max_years'] + 1))
+                                
+                                # Call bare-metal engine directly (returns lists of dicts, not DataFrames)
+                                s_res, _, _, _ = run_simulation(m_seq, c)
+                                val = s_res[-1]['Net Worth'] if s_res else 0
                                 
                                 if view_todays_dollars:
-                                    val /= ((1 + c['infl'] / 100) ** c['max_years'])
+                                    val /= ((1 + c['infl'] / 100.0) ** c['max_years'])
                                 return val
-
-                            nw_down = run_scenario(down_val)
-                            nw_up = run_scenario(up_val)
+                        
+                        results = []
+                        
+                        # --- FIX: Execute all 10 alternate timelines simultaneously ---
+                        with ThreadPoolExecutor(max_workers=10) as executor:
+                            future_map = {}
                             
-                            d_down = nw_down - base_nw_sens
-                            d_up = nw_up - base_nw_sens
-                            
-                            if d_up > d_down:
-                                p_d, n_d = d_up, d_down
-                                p_l = f"+{up_val}{unit}" if up_val > 0 else f"{up_val}{unit}"
-                                n_l = f"{down_val}{unit}" if down_val < 0 else f"+{down_val}{unit}"
-                            else:
-                                p_d, n_d = d_down, d_up
-                                p_l = f"{down_val}{unit}" if down_val < 0 else f"+{down_val}{unit}"
-                                n_l = f"+{up_val}{unit}" if up_val > 0 else f"{up_val}{unit}"
+                            # 1. Dispatch all tasks to the thread pool instantly
+                            for name, key, down_val, up_val, unit in sens_scenarios:
+                                f_down = executor.submit(run_scenario, down_val, key)
+                                f_up = executor.submit(run_scenario, up_val, key)
+                                future_map[name] = (f_down, f_up, down_val, up_val, unit)
                                 
-                            results.append({
-                                "Parameter": name,
-                                "Spread": abs(p_d - n_d),
-                                "Pos_Delta": p_d,
-                                "Neg_Delta": n_d,
-                                "Pos_Label": p_l,
-                                "Neg_Label": n_l
-                            })
+                            # 2. Collect and map results as they finish
+                            for name, (f_down, f_up, down_val, up_val, unit) in future_map.items():
+                                nw_down = f_down.result()
+                                nw_up = f_up.result()
+                                
+                                d_down = nw_down - base_nw_sens
+                                d_up = nw_up - base_nw_sens
+                                
+                                if d_up > d_down:
+                                    p_d, n_d = d_up, d_down
+                                    p_l = f"+{up_val}{unit}" if up_val > 0 else f"{up_val}{unit}"
+                                    n_l = f"{down_val}{unit}" if down_val < 0 else f"+{down_val}{unit}"
+                                else:
+                                    p_d, n_d = d_down, d_up
+                                    p_l = f"{down_val}{unit}" if down_val < 0 else f"+{down_val}{unit}"
+                                    n_l = f"+{up_val}{unit}" if up_val > 0 else f"{up_val}{unit}"
+                                    
+                                results.append({
+                                    "Parameter": name,
+                                    "Spread": abs(p_d - n_d),
+                                    "Pos_Delta": p_d,
+                                    "Neg_Delta": n_d,
+                                    "Pos_Label": p_l,
+                                    "Neg_Label": n_l
+                                })
                             
                         results = sorted(results, key=lambda x: x['Spread'], reverse=False)
                         st.session_state['sens_results'] = results
                         
+                        # --- FIX: Store the hash of the context used to generate these results ---
+                        st.session_state['sens_ctx_hash'] = current_ctx_hash
+                        
                 if 'sens_results' in st.session_state and HAS_PLOTLY:
+                    # Render the warning banner if stale
+                    if st.session_state.get('sens_ctx_hash') != current_ctx_hash:
+                        info_banner("⚠️ Inputs have changed. These results are based on a previous configuration. Please re-run the sensitivity analysis for updated metrics.", type="warning")
+                        
                     r_data = st.session_state['sens_results']
                     y_vals = [r['Parameter'] for r in r_data]
                     
@@ -2649,7 +3038,13 @@ def render_simulation():
                         margin=dict(l=20, r=80, t=50, b=80) 
                     )
                     fig_tor = apply_chart_theme(fig_tor, "Sensitivity Tornado Chart")
-                    st.plotly_chart(fig_tor, use_container_width=True)
+                    
+                    # --- FIX: Remove invalid kwargs. Warning banner above provides the 'Stale' context ---
+                    if st.session_state.get('sens_ctx_hash') != current_ctx_hash:
+                        # Banner is already rendered above this block in your current code
+                        st.plotly_chart(fig_tor, width='stretch')
+                    else:
+                        st.plotly_chart(fig_tor, width='stretch')
 
             # --- AND SAME FOR THIS ONE ---
             with out_tab_mc:
@@ -2665,7 +3060,7 @@ def render_simulation():
 
                 with col_mc3:
                     st.markdown("<div style='height: 27px;'></div>", unsafe_allow_html=True)
-                    run_mc = st.button("✨ Run Monte Carlo Simulation", type="primary", use_container_width=True)
+                    run_mc = st.button("✨ Run Monte Carlo Simulation", type="primary", width='stretch')
 
                 if run_mc:
                     with st.spinner(f"Rendering {mc_runs} parallel market sequences (NumPy Vectorized & Thread-Safe)..."):
@@ -2678,19 +3073,24 @@ def render_simulation():
                         # Vectorized sequence generation
                         mc_matrix = np.random.normal(loc=sim_ctx['mkt'], scale=mc_vol, size=(mc_runs, years_count))
                         mc_matrix = np.maximum(-99.0, mc_matrix)
-                        random_sequences = [tuple(row) for row in mc_matrix]
+                        
+                        # --- FIX: C-Optimized instantly generated list of lists ---
+                        random_sequences = mc_matrix.tolist()
 
-                        # --- FIX 1: Serialize context to a string to completely sever Streamlit proxy references ---
+                        # 1. Create the immutable JSON string in the main thread FIRST
                         ctx_json_mc = json.dumps(sim_ctx)
                         
-                        # --- FIX 2: Create an isolated worker that deserializes fresh memory per thread ---
-                        def thread_worker(seq_tuple, ctx_str):
-                            # json.loads guarantees 100% pure Python dicts with zero shared references
-                            return run_simulation(list(seq_tuple), json.loads(ctx_str))
+                        # 2. Define a worker function that deserializes INSIDE the isolated thread
+                        def thread_worker(seq_list, ctx_str):
+                            # json.loads guarantees 100% pure Python dicts with zero shared memory references
+                            isolated_ctx = json.loads(ctx_str)
+                            
+                            # --- FIX: Pass the native list directly, no redundant tuple casting ---
+                            return run_simulation(seq_list, isolated_ctx)
 
                         try:
                             with ThreadPoolExecutor(max_workers=min(mc_runs, 8)) as executor:
-                                # Pass the pure JSON string and the worker function
+                                # 3. Pass the immutable string to the worker
                                 futures = {executor.submit(thread_worker, seq, ctx_json_mc): i for i, seq in enumerate(random_sequences)}
 
                                 for completed_idx, future in enumerate(concurrent.futures.as_completed(futures)):
@@ -2701,9 +3101,19 @@ def render_simulation():
                                         nw_path = res_mc["Net Worth"].tolist()
                                         all_nw_paths.append(nw_path)
                                         if res_mc.iloc[-1].get("Unfunded Debt", 0) <= 0: success_count += 1
-                                    if completed_idx % max(1, mc_runs // 20) == 0: mc_progress.progress(min(1.0, (completed_idx + 1) / mc_runs))
+                                        
+                                    if completed_idx % max(1, mc_runs // 20) == 0: 
+                                        mc_progress.progress(min(1.0, (completed_idx + 1) / mc_runs))
                         except Exception as e:
-                            st.error(f"Simulation failed during multi-threading: {e}")
+                            # --- FIX: Purge Stale State on Engine Failure ---
+                            # Guarantee that a crashed simulation cannot leave behind 
+                            # a false "Success Rate" badge on the main dashboard.
+                            st.session_state['mc_success_rate'] = None
+                            if 'mc_raw_results' in st.session_state:
+                                st.session_state['mc_raw_results'] = None
+                                
+                            st.error(f"🚨 Monte Carlo Engine Error: {str(e)}")
+                            st.stop()
                         finally:
                             mc_progress.empty()
 
@@ -2743,17 +3153,7 @@ def render_simulation():
                                 fig_mc.add_trace(go.Scatter(x=years_list, y=p10, mode='lines', name='10th Percentile (Severe)', line=dict(color='#f43f5e', dash='dot')))
                                 fig_mc = apply_chart_theme(fig_mc, "Stochastic Net Worth Projections")
                                 
-                                # --- FIX: Expand top margin and center the legend so it doesn't clip on the right ---
-                                fig_mc.update_layout(
-                                    margin=dict(t=90), # Increase top margin from default 50 to 90
-                                    legend=dict(
-                                        x=0.5,         # Center horizontally
-                                        xanchor='center',
-                                        y=1.08,        # Push slightly higher above the grid
-                                        yanchor='bottom'
-                                    )
-                                )
-                                st.plotly_chart(fig_mc, use_container_width=True)
+                                st.plotly_chart(fig_mc, width='stretch')
 
             with out_tab_tax:
                 st.markdown('<div class="info-text" style="margin-bottom: 20px;">💡 <strong>Dual Tax Dashboard:</strong> The top chart visualizes your progressive tax brackets and how Roth Conversions (if enabled) fill those brackets. The bottom chart breaks down exactly what kind of taxes you are paying each year.</div>', unsafe_allow_html=True)
@@ -2820,7 +3220,7 @@ def render_simulation():
                     )
                     
                     fig_tax = apply_chart_theme(fig_tax)
-                    st.plotly_chart(fig_tax, use_container_width=True)
+                    st.plotly_chart(fig_tax, width='stretch')
                 else:
                     st.info("Please install Plotly to view the charts.")
 
@@ -2859,14 +3259,14 @@ def render_simulation():
                 st.download_button(label="📥 Download Full Simulation (.xlsx)", data=output.getvalue(),
                                    file_name='retirement_simulation.xlsx',
                                    mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                                   type="primary", use_container_width=True)
+                                   type="primary", width='stretch')
 
                 t1, t2 = st.tabs(["Income & Expense Log", "Net Worth Log"])
-                with t1: st.dataframe(df_det[ord_det].set_index("Year").style.format({c: "${:,.0f}" for c in ord_det if c not in ["Age (Primary)", "Age (Spouse)", "Year"]} | {"Age (Primary)": "{:.0f}", "Age (Spouse)": "{:.0f}"}), use_container_width=True)
+                with t1: st.dataframe(df_det[ord_det].set_index("Year").style.format({c: "${:,.0f}" for c in ord_det if c not in ["Age (Primary)", "Age (Spouse)", "Year"]} | {"Age (Primary)": "{:.0f}", "Age (Spouse)": "{:.0f}"}), width='stretch')
                 with t2:
                     st.dataframe(df_nw[ord_nw].set_index("Year").style.format(
                         {c: "${:,.0f}" for c in ord_nw if c not in ["Age (Primary)", "Age (Spouse)", "Year"]} | {
-                            "Age (Primary)": "{:.0f}", "Age (Spouse)": "{:.0f}"}), use_container_width=True)
+                            "Age (Primary)": "{:.0f}", "Age (Spouse)": "{:.0f}"}), width='stretch')
 
 
 def render_ai():
@@ -2911,25 +3311,67 @@ def render_ai():
     else:
         sim_summary, ai_assumptions, timeline_summary = {}, {}, []
 
+    # --- FIX: AI State & API Key Guard ---
+    ai_disabled = st.session_state.get('ai_loading', False) or not GEMINI_API_KEY
+    tooltip = "⚠️ Gemini API Key missing in secrets.toml" if not GEMINI_API_KEY else "Run AI Analysis"
+    
     tab_report, tab_whatif = st.tabs(["📊 Comprehensive Health Report", "🔮 What-If Simulator"])
     
     with tab_report:
-        if st.button("✨ Generate Comprehensive AI Report", type="primary", use_container_width=True, key="btn_report"):
+        if st.button("✨ Generate Comprehensive AI Report", type="primary", width='stretch', key="btn_report", disabled=ai_disabled, help=tooltip):
             st.session_state['trigger_report_ai'] = True
+            st.session_state['ai_loading'] = True
+            st.rerun()
             
         if st.session_state.get('trigger_report_ai'):
-            if check_ai_rate_limit():
-                if sim_summary:
-                    try:
+            try:
+                if check_ai_rate_limit():
+                    if sim_summary:
                         with st.spinner("AI extracting timeseries data and acting as fiduciary advisor..."):
-                            # --- FIX: Injected ai_assumptions into the prompt ---
-                            prompt = f"""Act as an expert fiduciary financial planner. Review this user's summary: {json.dumps(sim_summary)}, their core economic & strategic assumptions: {json.dumps(ai_assumptions)}, and their chronological 5-year cash flow progression: {json.dumps(timeline_summary)}. 
+                            
+                            # --- FIX: Extract their current SS plan to give the AI context ---
+                            ss_context = [r for r in sim_ctx['inc_records'] if r.get('Category') == 'Social Security']
+                            
+                            # Armor the payload against injection
+                            safe_summary = json.dumps(sanitize_for_ai(sim_summary))
+                            safe_assumptions = json.dumps(sanitize_for_ai(ai_assumptions))
+                            safe_timeline = json.dumps(sanitize_for_ai(timeline_summary))
+                            safe_ss = json.dumps(sanitize_for_ai(ss_context))
+                            
+                            prompt = f"""
+                            You are an elite, fiduciary Certified Financial Planner (CFP) and CPA. Your job is to provide a ruthless, highly tactical, and mathematically sound evaluation of the user's financial blueprint. Do not provide generic advice (e.g., "save more money"). Use their exact numbers, ages, and timelines to provide actionable directives.
 
-                            Provide a highly detailed, year-by-year or phase-by-phase tactical analysis based strictly on these parameters. 
+                            Here is the user's profile and simulation data:
+                            - Baseline Summary: {safe_summary}
+                            - Economic Assumptions: {safe_assumptions}
+                            - Social Security Plan: {safe_ss}
+                            - 5-Year Cash Flow Progression: {safe_timeline}
 
-                            CRITICAL INSTRUCTION: You MUST include a distinct, bolded section titled "Roth Conversion Strategy Blueprint". In this section, provide actionable, mathematical advice on EXACTLY when they should execute Roth conversions. For example: "Between ages X and Y, convert $Z per year to fill the 24% bracket before RMDs begin at age 75." Be as specific as possible using their exact numbers and tax data.
+                            Format your response in clean, professional Markdown using the following exact structure:
 
-                            Format your response in clean Markdown."""
+                            ### 1. Executive Fiduciary Assessment
+                            Provide a 2-3 sentence blunt assessment of their trajectory. Are they facing a liquidity crisis? Are they over-indexed in real estate? Are they going to die with too much money? 
+
+                            ### 2. Tactical Social Security Optimization
+                            Analyze their current Social Security claiming plan ({safe_ss}). 
+                            - Calculate the trade-off based on their life expectancy. 
+                            - Should the primary earner delay to 70? Should the spouse claim early at 62? 
+                            - Explicitly tell them if their current plan is optimal or if it is costing them money.
+
+                            ### 3. Roth Conversion Strategy Blueprint
+                            Based on their progressive tax brackets and '5-Year Cash Flow Progression':
+                            - Identify the "low income" gap years (usually between retirement and RMD age at 73/75).
+                            - Give exact mathematical instructions on Roth conversions. Example: "You have a $40k gap before hitting the 24% bracket in year X. Convert $40k from your Traditional 401(k) to a Roth IRA to fill this bucket."
+                            - Warn them if forced RMDs will push them into a massive tax bracket later in life.
+
+                            ### 4. Healthcare & IRMAA Warning
+                            Cross-reference their retirement age with Medicare eligibility (age 65).
+                            - If they retire before 65, warn them about the "Pre-Medicare Gap" costs.
+                            - Check their later years for IRMAA (Medicare high-income surcharges) triggered by RMDs or high living expenses.
+
+                            ### 5. Sequence of Returns Risk & Liquidity
+                            Look at their liquid cash versus their investment accounts in the first 5 years of retirement. Do they have enough cash to survive a 25% market crash without selling stocks at the bottom? Recommend an exact cash buffer size based on their annual expenses.
+                            """
 
                             res = call_gemini_text(prompt)
                             if res:
@@ -2937,28 +3379,29 @@ def render_ai():
                                 mark_dirty()
                             else:
                                 st.error("⚠️ AI Analysis failed to generate.")
-                    finally:
-                        st.session_state['trigger_report_ai'] = False
-                        st.rerun()
-                else:
-                    st.warning("Please run the baseline simulation first on the Dashboard or Simulation tab.")
-                    st.session_state['trigger_report_ai'] = False
+                    else:
+                        st.warning("Please run the baseline simulation first on the Dashboard or Simulation tab.")
+            finally:
+                st.session_state['trigger_report_ai'] = False
+                st.session_state['ai_loading'] = False
+                st.rerun()
 
         if 'ai_analysis_report' in st.session_state:
             st.markdown(st.session_state['ai_analysis_report'].replace('$', '&#36;'), unsafe_allow_html=True)
 
     with tab_whatif:
-        what_if_query = st.text_area("Ask the AI to simulate a scenario (e.g., 'What if I sold my rental property in 2030 and put the cash in my brokerage?' or 'What if inflation hits 5% for the next decade?')", key="what_if_text")
+        what_if_query = st.text_area("Ask the AI to simulate a scenario (e.g., 'What if I sold my rental property in 2030 and put the cash in my brokerage?')", key="what_if_text")
         
-        if st.button("✨ Run What-If Analysis (AI)", type="primary", use_container_width=True, key="btn_whatif"):
+        if st.button("✨ Run What-If Analysis (AI)", type="primary", width='stretch', key="btn_whatif", disabled=ai_disabled, help=tooltip):
             st.session_state['trigger_whatif_ai'] = True
+            st.session_state['ai_loading'] = True
+            st.rerun()
 
         if st.session_state.get('trigger_whatif_ai'):
-            if check_ai_rate_limit():
-                if sim_summary and what_if_query:
-                    try:
+            try:
+                if check_ai_rate_limit():
+                    if sim_summary and what_if_query:
                         with st.spinner("AI processing alternative timelines and computing what-if scenario..."):
-                            # --- FIX: Injected ai_assumptions into the prompt ---
                             prompt = f"Act as an expert fiduciary financial planner. Review this user's baseline simulation summary: {json.dumps(sim_summary)}, their baseline economic assumptions: {json.dumps(ai_assumptions)}, and their chronological 5-year cash flow progression: {json.dumps(timeline_summary)}. The user wants to run the following 'what-if' scenario: '{what_if_query}'. Analyze how this change would mathematically and strategically impact their net worth, cash flow, and tax strategy compared to their baseline assumptions. Provide a highly detailed, reasonable estimate and tactical breakdown of this scenario. Format your response in clean Markdown."
                             res = call_gemini_text(prompt)
                             if res:
@@ -2966,15 +3409,14 @@ def render_ai():
                                 mark_dirty()
                             else:
                                 st.error("⚠️ AI Analysis failed to generate.")
-                    finally:
-                        st.session_state['trigger_whatif_ai'] = False
-                        st.rerun()
-                elif not what_if_query:
-                    st.warning("Please enter a scenario to simulate.")
-                    st.session_state['trigger_whatif_ai'] = False
-                else:
-                    st.warning("Please run the baseline simulation first.")
-                    st.session_state['trigger_whatif_ai'] = False
+                    elif not what_if_query:
+                        st.warning("Please enter a scenario to simulate.")
+                    else:
+                        st.warning("Please run the baseline simulation first.")
+            finally:
+                st.session_state['trigger_whatif_ai'] = False
+                st.session_state['ai_loading'] = False
+                st.rerun()
 
         if 'what_if_analysis_report' in st.session_state:
             st.markdown(st.session_state['what_if_analysis_report'].replace('$', '&#36;'), unsafe_allow_html=True)
@@ -2983,252 +3425,193 @@ def render_ai():
 def render_faq():
     section_header("Complete Beginner's Guide & FAQ", "Everything you need to know about the engine.", "📖")
 
-    st.subheader("🌟 GETTING STARTED")
+    # --- FIX: Live Search Filter ---
+    search_q = st.text_input("🔍 Search the Guide...", "", help="Type a keyword like 'taxes', 'Roth', or 'Medicare'").lower()
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # --- FIX: Smart Rendering Helper ---
+    def show_faq(question, answer, default_expanded=False):
+        # Only render if there's no search, OR if the search matches the question/answer
+        if not search_q or search_q in question.lower() or search_q in answer.lower():
+            # Force expand if they are actively searching for something, otherwise use the default
+            is_expanded = True if search_q else default_expanded
+            with st.expander(question, expanded=is_expanded):
+                st.markdown(answer)
+
+    # Only show section headers if the user isn't actively filtering
+    if not search_q: st.subheader("🌟 GETTING STARTED")
     
-    with st.expander("What exactly does this app do, and how is it different from a basic retirement calculator?"):
-        st.markdown("""
-        Most retirement calculators ask you two questions — "how much do you have saved?" and "when do you want to retire?" — then spit out a single number. This app is fundamentally different. It builds a living, breathing financial model of your entire life — from today until the end of your life expectancy — and simulates every dollar coming in and going out, year by year. 
-        
-        It accounts for things a basic calculator completely ignores: your mortgage paying itself off over time, your kids going to college, your taxes changing when you retire, Social Security kicking in, Medicare starting at 65, your investment accounts being drawn down in the smartest possible tax order, and hundreds of other real-life events. The result isn't just a number — it's a full financial roadmap with warnings, milestones, and actionable advice.
-        """)
-
-    with st.expander("Is this app a replacement for a financial advisor?"):
-        st.markdown("""
-        No, and it's important to be honest about that. This app is an incredibly powerful planning and education tool — it helps you understand your own numbers, test scenarios, and have much smarter conversations with professionals. 
-        
-        But it is not a licensed fiduciary advisor and cannot account for every personal circumstance, recent law change, or market condition. Think of it the way you'd think of WebMD: extremely useful for understanding what's happening with your health, but you still want a doctor making the final call on major decisions. Use this app to get clarity, then bring your printouts to a CPA or Certified Financial Planner (CFP) for personalized guidance.
-        """)
-
-    with st.expander("How accurate are these projections?"):
-        st.markdown("""
-        The projections are as accurate as the information you put in, combined with the assumptions you choose. The simulation engine uses real IRS tax brackets, real Social Security claiming rules, and real Medicare cost structures. 
-        
-        However, it cannot predict the future — no tool can. What it can do is show you the most mathematically likely outcomes based on historical data and your personal numbers. The Monte Carlo feature is specifically designed to stress-test your plan against hundreds of unpredictable futures so you understand your real risk, not just the rosy average-case scenario.
-        """)
-
-    st.subheader("👨‍👩‍👧‍👦 YOUR PROFILE & FAMILY")
+    show_faq("What exactly does this app do, and how is it different from a basic retirement calculator?",
+    """Most retirement calculators ask you two questions — "how much do you have saved?" and "when do you want to retire?" — then spit out a single number. This app is fundamentally different. It builds a living, breathing financial model of your entire life — from today until the end of your life expectancy — and simulates every dollar coming in and going out, year by year. 
     
-    with st.expander("Why does the app need my exact date of birth instead of just my age?"):
-        st.markdown("""
-        Because a few months can actually matter quite a bit in retirement planning. Your exact birth year determines three important things:
+    It accounts for things a basic calculator completely ignores: your mortgage paying itself off over time, your kids going to college, your taxes changing when you retire, Social Security kicking in, Medicare starting at 65, your investment accounts being drawn down in the smartest possible tax order, and hundreds of other real-life events. The result isn't just a number — it's a full financial roadmap with warnings, milestones, and actionable advice.""", 
+    default_expanded=True) # <-- EXPANDED BY DEFAULT
 
-        * **Your Social Security Full Retirement Age (FRA):** If you were born in 1960 or later, your FRA is 67. Born between 1955-1959, it's somewhere between 66 and 67. This is the age at which you receive your full Social Security benefit — claim earlier and you get permanently less, claim later and you get permanently more.
-        * **When your RMDs begin:** RMD stands for Required Minimum Distribution. The IRS forces you to start withdrawing money from your traditional retirement accounts at a certain age — either 73 or 75, depending on your birth year. Getting this wrong by even one year can create a surprise tax bill.
-        * **Your IRS Catch-Up Contribution eligibility:** Once you turn 50, you're allowed to contribute extra money to your 401(k) and IRA above the normal limits. The app needs your age to know when to apply this bonus.
-        """)
-
-    with st.expander("What changes when I add a spouse?"):
-        st.markdown("""
-        Quite a lot, actually. Adding a spouse unlocks a completely different set of tax rules that are generally more favorable:
-
-        * **Married Filing Jointly (MFJ)** tax brackets are roughly double the single brackets, meaning you pay a lower tax rate on the same income.
-        * **Standard Deduction** doubles from approximately $14,600 to $29,200.
-        * **Social Security survivor benefits** activate — if one spouse passes away, the surviving spouse automatically inherits the higher of the two Social Security benefit amounts.
-        * **Retirement account strategies** change — the app can now optimize withdrawals across two people's accounts.
-        * **Lifestyle cost reduction** — the simulation realistically models that a surviving spouse spends less (roughly 60% of the couple's former expenses) after the other passes.
-        """)
-
-    with st.expander("What are 'dependents' used for in the simulation?"):
-        st.markdown("""
-        The app uses your children's ages to automatically time several important financial events. It models when child-related expenses (extracurricular activities, higher grocery bills, larger utility costs) naturally phase out as each child grows up and leaves home. 
-        
-        It also uses their ages to calculate exactly when college tuition expenses should start and end in your cash flow. If you have a 529 college savings plan, the app connects it directly to your specific child's tuition costs, drawing down that account automatically when the bills arrive.
-        """)
-
-    st.subheader("💵 INCOME & SOCIAL SECURITY")
+    show_faq("Is this app a replacement for a financial advisor?",
+    """No, and it's important to be honest about that. This app is an incredibly powerful planning and education tool — it helps you understand your own numbers, test scenarios, and have much smarter conversations with professionals. 
     
-    with st.expander("What is an 'employer 401(k) match' and why is it listed under income instead of savings?"):
-        st.markdown("""
-        An employer match is essentially free money your company adds to your retirement account when you contribute your own money. For example, your employer might match 50 cents for every dollar you put in, up to 6% of your salary. 
-        
-        It's listed under "Income" purely so the app can track it separately from your own contributions. This is important because employer match money goes directly into your 401(k) and is never spendable take-home cash. The app is careful to never count it as money you can spend on bills, but it does add it to your growing 401(k) balance behind the scenes so your retirement account grows accurately.
-        """)
+    But it is not a licensed fiduciary advisor and cannot account for every personal circumstance, recent law change, or market condition. Think of it the way you'd think of WebMD: extremely useful for understanding what's happening with your health, but you still want a doctor making the final call on major decisions. Use this app to get clarity, then bring your printouts to a CPA or Certified Financial Planner (CFP) for personalized guidance.""", 
+    default_expanded=True) # <-- EXPANDED BY DEFAULT
 
-    with st.expander("What is Social Security, and how does the app calculate my benefit?"):
-        st.markdown("""
-        Social Security is a federal retirement program you've been paying into your entire working life through payroll taxes. When you retire, you receive a monthly payment for life based on your 35 highest-earning years of work history. 
-        
-        The critical decision the app helps you model is when to claim:
-        * **Claim at 62 (earliest possible):** Your benefit is permanently reduced by up to 30%.
-        * **Claim at your Full Retirement Age (66-67):** You receive 100% of your earned benefit.
-        * **Claim at 70 (latest recommended):** Your benefit is permanently increased by up to 24%.
-
-        There is no single "right" answer — it depends on your health, other income sources, and whether you're married. The app lets you test different claiming ages to see the lifetime impact.
-        """)
-
-    with st.expander("What does 'taxable Social Security' mean? I thought Social Security wasn't taxed?"):
-        st.markdown("""
-        This is one of the most surprising things people discover about retirement. Social Security can be taxed — up to 85% of your benefit can be added to your taxable income depending on how much other income you have. 
-        
-        The IRS uses something called "Provisional Income" (basically your other income plus half your Social Security) to determine how much of your benefit is taxable. If your Provisional Income is low enough, your Social Security is completely tax-free. As your other income (from RMDs, investments, rent, etc.) rises, more of your Social Security becomes taxable. The app calculates this automatically every single year using the exact IRS formula.
-        """)
-
-    st.subheader("🏦 ASSETS, ACCOUNTS & INVESTING")
+    show_faq("How accurate are these projections?",
+    """The projections are as accurate as the information you put in, combined with the assumptions you choose. The simulation engine uses real IRS tax brackets, real Social Security claiming rules, and real Medicare cost structures. 
     
-    with st.expander("What is the difference between all these account types? (401k, IRA, Roth, Brokerage...)"):
-        st.markdown("""
-        This is one of the most important concepts to understand. All of these are just containers that hold your investments — the difference is purely about when the IRS taxes the money inside them. 
-        
-        * **Traditional 401(k) and Traditional IRA ("Pay taxes later"):** You put money in before paying taxes. Your money grows tax-free. When you withdraw it in retirement, you pay income taxes on every dollar you take out. The IRS forces you to start withdrawing at age 73 or 75 (RMDs).
-        * **Roth 401(k) and Roth IRA ("Pay taxes now, never again"):** You put money in after already paying taxes on it. Your money grows tax-free and you can withdraw it in retirement completely tax-free, with no RMDs ever required.
-        * **Brokerage (Taxable) Account ("Pay taxes as you go"):** A regular investment account with no special tax protection. You pay taxes on dividends and capital gains. However, there are no contribution limits and no restrictions on withdrawals. 
-        * **HSA (Health Savings Account) ("Triple tax advantage"):** You contribute pre-tax, it grows tax-free, and withdrawals for medical expenses are tax-free. After age 65, you can withdraw for any reason (paying normal income tax).
-        * **529 Plan ("Tax-free college savings"):** Money grows tax-free and can be withdrawn completely tax-free when used for qualified education expenses.
-        """)
+    However, it cannot predict the future — no tool can. What it can do is show you the most mathematically likely outcomes based on historical data and your personal numbers. The Monte Carlo feature is specifically designed to stress-test your plan against hundreds of unpredictable futures so you understand your real risk, not just the rosy average-case scenario.""")
 
-    with st.expander("How does the app decide which account to withdraw from first? (Withdrawal Strategy)"):
-        st.markdown("""
-        When your expenses exceed your income, you have a "shortfall" and must sell investments. The order in which you sell them has massive tax implications. The engine allows you to choose between two strategies in the "Stress Tests & Taxes" tab:
-        
-        * **Standard Strategy (Default):** The engine drains liquid cash first, then Taxable Brokerage accounts (paying Capital Gains), then Traditional 401(k)s/IRAs (paying Income Tax), and finally leaves your tax-free Roth accounts to grow for as long as possible.
-        * **Roth Preferred:** The engine drains liquid cash, then Taxable Brokerages, but then flips the script: it drains Roth accounts completely *before* touching Traditional 401(k)s. This is sometimes preferred by early retirees trying to keep their taxable income artificially low to qualify for healthcare subsidies.
-        """)
-
-    with st.expander("What happens if my plan runs out of money? (Shortfall Borrowing Rate)"):
-        st.markdown("""
-        If your expenses completely drain all of your liquid assets, brokerage accounts, and retirement accounts, the app does not simply break or stop calculating. 
-        
-        Instead, it enters **"Liquidity Crisis"** mode. It tracks the missing money as "Unfunded Debt." Because you still need to pay your bills, the engine assumes you must borrow this money via personal loans or credit cards. The Unfunded Debt will compound aggressively year over year based on the **Shortfall Borrowing Rate** you set in your Macro Assumptions (defaulting to 12%). This provides a realistic, mathematically punishing look at what happens when a retiree outlives their money.
-        """)
-
-    with st.expander("What are 'RMDs' and why do they matter so much?"):
-        st.markdown("""
-        RMD stands for Required Minimum Distribution. The IRS has a simple rule: you cannot keep money in a Traditional 401(k) or IRA forever. Starting at age 73 (or 75 if you were born in 1960 or later), you must withdraw a minimum amount every single year, whether you need the money or not. 
-        
-        Why do they matter? Because every dollar you're forced to withdraw is added to your taxable income that year — which can push you into a higher tax bracket, cause more of your Social Security to become taxable, and trigger Medicare surcharges (IRMAA). 
-        """)
-
-    st.subheader("🏡 REAL ESTATE & MORTGAGES")
+    if not search_q: st.subheader("👨‍👩‍👧‍👦 YOUR PROFILE & FAMILY")
     
-    with st.expander("How does the app handle my mortgage?"):
-        st.markdown("""
-        You simply enter three things: your current loan balance, your interest rate, and your monthly payment. The app then does something most calculators don't — it mathematically pays down your mortgage month by month, exactly as your bank would, separating out the interest and principal portions correctly. 
-        
-        When the balance finally hits zero, the mortgage expense automatically disappears from your cash flow for every future year. **You should NOT separately list your mortgage payment in the budget section** — the app handles it entirely through your real estate entry.
-        """)
+    show_faq("Why does the app need my exact date of birth instead of just my age?",
+    """Because a few months can actually matter quite a bit in retirement planning. Your exact birth year determines three important things:
 
-    with st.expander("What's the difference between a 'primary residence' and an 'investment property' in the app?"):
-        st.markdown("""
-        The app treats these completely differently:
-        * **Your primary residence** is where you live. Its mortgage payment and monthly expenses (property taxes, insurance, HOA) flow out as living costs. 
-        * **An investment property** is treated as a business. The app calculates the net cash flow — rent collected minus mortgage payment minus expenses — and only the net profit or loss affects your overall cash flow. This prevents investment properties from artificially inflating your apparent lifestyle income.
-        """)
+    * **Your Social Security Full Retirement Age (FRA):** If you were born in 1960 or later, your FRA is 67. Born between 1955-1959, it's somewhere between 66 and 67. This is the age at which you receive your full Social Security benefit.
+    * **When your RMDs begin:** RMD stands for Required Minimum Distribution. The IRS forces you to start withdrawing money from your traditional retirement accounts at a certain age — either 73 or 75, depending on your birth year. 
+    * **Your IRS Catch-Up Contribution eligibility:** Once you turn 50, you're allowed to contribute extra money to your 401(k) and IRA above the normal limits. The app needs your age to know when to apply this bonus.""")
 
-    st.subheader("💸 BUDGETS & EXPENSES")
+    show_faq("What changes when I add a spouse?",
+    """Quite a lot, actually. Adding a spouse unlocks a completely different set of tax rules that are generally more favorable:
+
+    * **Married Filing Jointly (MFJ)** tax brackets are roughly double the single brackets.
+    * **Standard Deduction** doubles from approximately $14,600 to $29,200.
+    * **Social Security survivor benefits** activate — if one spouse passes away, the surviving spouse automatically inherits the higher of the two Social Security benefit amounts.
+    * **Retirement account strategies** change — the app can now optimize withdrawals across two people's accounts.
+    * **Lifestyle cost reduction** — the simulation realistically models that a surviving spouse spends less (roughly 60% of the couple's former expenses) after the other passes.""")
+
+    show_faq("What are 'dependents' used for in the simulation?",
+    """The app uses your children's ages to automatically time several important financial events. It models when child-related expenses (extracurricular activities, higher grocery bills, larger utility costs) naturally phase out as each child grows up and leaves home. 
     
-    with st.expander("The expense table has 'Start Phase' and 'End Phase' — what do these mean?"):
-        st.markdown("""
-        These control exactly when each expense is active in your lifetime simulation:
+    It also uses their ages to calculate exactly when college tuition expenses should start and end in your cash flow. If you have a 529 college savings plan, the app connects it directly to your specific child's tuition costs, drawing down that account automatically when the bills arrive.""")
 
-        * **"Now"** means the expense starts today and continues until whatever end phase you choose.
-        * **"At Retirement"** means the expense either starts when you retire (like a new travel budget) or ends when you retire (like your work commute costs).
-        * **"End of Life"** means the expense continues until the very last year of your simulation.
-        * **"Custom Year"** lets you enter a specific year — useful for things like college tuition or a car payment that ends in 2027.
-
-        *A critical rule:* If an expense changes at retirement (like your grocery bill going down slightly), you should create TWO rows — one that goes from "Now" to "At Retirement," and a separate one that goes from "At Retirement" to "End of Life" with the new amount.
-        """)
-
-    with st.expander("How does healthcare inflation work, and why is it different from regular inflation?"):
-        st.markdown("""
-        Regular consumer inflation (food, clothing, electronics, etc.) has historically averaged around 2-3% per year. Healthcare costs, however, have consistently risen at 5-7% per year for decades — nearly double the overall inflation rate. 
-        
-        This means a healthcare expense that costs $500/month today might cost over $1,300/month in 20 years. The app applies a separate, higher inflation rate specifically to anything categorized as "Healthcare" or "Insurance" to capture this reality. 
-        """)
-
-    st.subheader("🏥 HEALTHCARE & MEDICARE")
+    if not search_q: st.subheader("💵 INCOME & SOCIAL SECURITY")
     
-    with st.expander("What is the 'Pre-Medicare Gap' and why is it so expensive?"):
-        st.markdown("""
-        If you retire before age 65, you face a potentially brutal financial gap. Most working Americans get health insurance through their employer. The moment you retire, that coverage ends. You're now on your own for health insurance until Medicare kicks in at age 65.
-        
-        Buying private health insurance for a 60-year-old can easily cost $1,000-$2,000+ per month just in premiums. This is called the "Pre-Medicare Gap" and it catches many early retirees completely off guard. The app automatically adds this cost to your simulation if you retire before 65, scaled to your income level.
-        """)
-
-    with st.expander("What is 'IRMAA' and why might I have to pay extra for Medicare?"):
-        st.markdown("""
-        IRMAA stands for Income-Related Monthly Adjustment Amount. It's essentially a Medicare "high earner surcharge." If your income in retirement exceeds certain thresholds (starting around $103,000/year for singles or $206,000/year for couples in 2026 dollars), the government charges you extra for your Medicare premiums. 
-        
-        The sneaky part: the income the government uses to calculate IRMAA includes your RMDs, Social Security, investment income, and Roth conversions. The app calculates and applies IRMAA automatically every year based on your projected income — which you can see isolated as a red bar on the Tax Breakdown chart.
-        """)
-
-    with st.expander("What is 'Long-Term Care' and why is it in the stress tests?"):
-        st.markdown("""
-        Long-Term Care (LTC) refers to extended help with daily activities — bathing, dressing, eating — typically needed in the final years of life due to illness or cognitive decline. This care is extremely expensive: a private nursing home room in the US costs $90,000-$120,000+ per year on average, and this is almost entirely NOT covered by regular Medicare.
-        
-        The "LTC Shock" stress test injects a massive medical expense into the final 2-3 years of your simulation to show what happens to your plan if you or a spouse needs this level of care. 
-        """)
-
-    st.subheader("📊 TAXES & ROTH CONVERSIONS")
+    show_faq("What is an 'employer 401(k) match' and why is it listed under income instead of savings?",
+    """An employer match is essentially free money your company adds to your retirement account when you contribute your own money. For example, your employer might match 50 cents for every dollar you put in, up to 6% of your salary. 
     
-    with st.expander("What is a 'progressive' tax system? Why don't I just multiply my income by my tax rate?"):
-        st.markdown("""
-        The US uses a system where higher income is taxed at progressively higher rates — but crucially, only the portion of your income that falls within each "bracket" is taxed at that bracket's rate. 
-        
-        Think of it like filling buckets. The first $23,200 of a married couple's income fills the 10% bucket. The next chunk fills the 12% bucket, and so on. Only income above the highest bracket threshold gets taxed at the top rate. This is why your actual tax bill is almost always less than your bracket rate would suggest.
-        """)
-        
-    with st.expander("How do I read the 'Tax Obligations Breakdown' chart?"):
-        st.markdown("""
-        Because taxes are often the single largest expense in retirement, the app separates them out so you can see exactly where your money is going:
-        
-        * **Baseline Federal & State Tax:** Your normal income taxes.
-        * **FICA (SS & Medicare):** Payroll taxes. You'll notice these completely disappear the year you retire.
-        * **Roth Conversion Taxes:** The extra income tax you volunteered to pay to move money from a Traditional to a Roth account.
-        * **Cap Gains & Penalties:** Taxes paid when you are forced to sell Brokerage assets, or the 10% IRS penalty if you withdraw from a 401(k) before age 59.5.
-        * **Medicare IRMAA Surcharge:** The hidden high-income Medicare penalty. 
-        """)
+    It's listed under "Income" purely so the app can track it separately from your own contributions. This is important because employer match money goes directly into your 401(k) and is never spendable take-home cash. The app is careful to never count it as money you can spend on bills, but it does add it to your growing 401(k) balance behind the scenes.""")
 
-    with st.expander("What is a Roth conversion and how does the Optimizer work?"):
-        st.markdown("""
-        A Roth conversion is a deliberate decision to move money from your Traditional 401(k) (where you'll owe taxes when you withdraw) into a Roth IRA (where all future growth and withdrawals are tax-free). You pay the income taxes on the converted amount now, in the current year.
-        
-        **How the Optimizer Works:** When enabled, it identifies the years where your taxable income is below your chosen target bracket (e.g., the 24% bracket). It calculates exactly how much money it can convert to fill that bracket up to the brim, checks if you have enough liquid cash to pay the tax bill, and executes the conversion automatically. 
-        """)
-
-    st.subheader("📈 AI, SENSITIVITY & MONTE CARLO SIMULATION")
+    show_faq("What is Social Security, and how does the app calculate my benefit?",
+    """Social Security is a federal retirement program you've been paying into your entire working life. When you retire, you receive a monthly payment for life based on your 35 highest-earning years. 
     
-    with st.expander("How do the AI Fiduciary Report and What-If Simulator work?"):
-        st.markdown("""
-        Instead of generic financial advice, the AI tab passes your *exact* mathematical timeline, your asset balances, and your specific macroeconomic assumptions to an advanced Large Language Model (Gemini).
-        
-        * **The Comprehensive Report** acts as a fiduciary planner reviewing your baseline file. It will tell you specifically when your highest tax years are, warn you of impending IRMAA cliffs, and lay out an exact blueprint for Roth Conversions.
-        * **The What-If Simulator** allows you to type natural language scenarios ("What if I sold my rental property in 2030 and put the cash in my brokerage?"). The AI calculates how that alters your trajectory compared to your baseline plan.
-        """)
+    The critical decision the app helps you model is when to claim:
+    * **Claim at 62 (earliest possible):** Your benefit is permanently reduced by up to 30%.
+    * **Claim at your Full Retirement Age (66-67):** You receive 100% of your earned benefit.
+    * **Claim at 70 (latest recommended):** Your benefit is permanently increased by up to 24%.""")
 
-    with st.expander("What is the Sensitivity 'Tornado' Chart?"):
-        st.markdown("""
-        A Sensitivity Analysis tests how fragile your plan is to a single variable changing. 
-        
-        The Tornado Chart runs 10 alternate dimensions of your life simultaneously—tweaking Inflation by 1%, dropping Market Returns by 1%, retiring 2 years early, etc.—and measures how much each tweak changes your Final Net Worth. It is sorted from the biggest impact at the top to the smallest at the bottom. This helps you figure out what you actually need to worry about (e.g., "Market returns matter a lot, but real estate growth barely moves the needle for me").
-        """)
-        
-    with st.expander("What is Sequence of Returns Risk?"):
-        st.markdown("""
-        This is one of the most misunderstood retirement risks. The order in which you experience market returns matters enormously once you're withdrawing from your portfolio. 
-        
-        If the market crashes 40% in your first year of retirement and you're forced to sell investments to cover living expenses, you're locking in permanent losses at the worst possible time. Even if the market recovers beautifully over the next decade, you have fewer shares left to benefit from that recovery. The "-25% Market Crash at Retirement" stress test directly simulates this risk.
-        """)
-
-    with st.expander("What is Monte Carlo simulation in plain English?"):
-        st.markdown("""
-        Imagine running your retirement plan 200 times in parallel, but each time the stock market behaves differently — sometimes great, sometimes terrible, sometimes mediocre. 
-        
-        Monte Carlo simulation takes your real financial plan and runs it through hundreds of randomly generated market scenarios based on historical volatility. The result is a "probability of success" percentage. An 85% success rate means that in 85 out of 100 randomly generated futures, your money lasted until the end of your life expectancy.
-        """)
-
-    st.subheader("💾 SAVING & SECURITY")
+    show_faq("What does 'taxable Social Security' mean? I thought Social Security wasn't taxed?",
+    """This is one of the most surprising things people discover about retirement. Social Security can be taxed — up to 85% of your benefit can be added to your taxable income depending on how much other income you have. 
     
-    with st.expander("Is my financial data safe?"):
-        st.markdown("""
-        Your data is stored in Google Firebase — one of the most secure cloud storage platforms in the world. Your account is protected by email and password authentication. 
-        
-        That said, no online system is completely immune to risk. This app is a planning tool — **you do not need to enter actual account numbers, social security numbers, or banking credentials anywhere**. Only use estimated balances and income figures.
-        """)
+    The IRS uses something called "Provisional Income" (basically your other income plus half your Social Security) to determine how much of your benefit is taxable. If your Provisional Income is low enough, your Social Security is completely tax-free. As your other income rises, more of your Social Security becomes taxable. The app calculates this automatically.""")
 
-    with st.expander("What happens to my data if I use 'Guest Mode'?"):
-        st.markdown("""
-        In Guest Mode, everything you enter exists only in your current browser session. The moment you close the browser tab or refresh the page, all of your data is permanently gone. Guest Mode is great for a quick exploration of the app's features (which is why it pre-loads the fictional "Johnson Family"), but if you want to save your plan and return to it later, you need to create a free account and click the "Save" button.
-        """)
+    if not search_q: st.subheader("🏦 ASSETS, ACCOUNTS & INVESTING")
+    
+    show_faq("What is the difference between all these account types? (401k, IRA, Roth, Brokerage...)",
+    """This is one of the most important concepts to understand. All of these are just containers that hold your investments — the difference is purely about when the IRS taxes the money inside them. 
+    
+    * **Traditional 401(k) and Traditional IRA ("Pay taxes later"):** You put money in before paying taxes. Your money grows tax-free. When you withdraw it in retirement, you pay income taxes on every dollar you take out.
+    * **Roth 401(k) and Roth IRA ("Pay taxes now, never again"):** You put money in after already paying taxes on it. Your money grows tax-free and you can withdraw it in retirement completely tax-free.
+    * **Brokerage (Taxable) Account ("Pay taxes as you go"):** A regular investment account with no special tax protection. You pay taxes on dividends and capital gains. 
+    * **HSA (Health Savings Account) ("Triple tax advantage"):** You contribute pre-tax, it grows tax-free, and withdrawals for medical expenses are tax-free.
+    * **529 Plan ("Tax-free college savings"):** Money grows tax-free and can be withdrawn completely tax-free when used for qualified education expenses.""")
+
+    show_faq("How does the app decide which account to withdraw from first? (Withdrawal Strategy)",
+    """When your expenses exceed your income, you have a "shortfall" and must sell investments. The order in which you sell them has massive tax implications. The engine allows you to choose between two strategies:
+    
+    * **Standard Strategy (Default):** Drains liquid cash first, then Taxable Brokerage accounts, then Traditional 401(k)s/IRAs, and finally leaves your tax-free Roth accounts to grow for as long as possible.
+    * **Roth Preferred:** Drains liquid cash, then Taxable Brokerages, but then flips the script: it drains Roth accounts completely *before* touching Traditional 401(k)s. This is sometimes preferred by early retirees trying to keep their taxable income artificially low for healthcare subsidies.""")
+
+    show_faq("What happens if my plan runs out of money? (Shortfall Borrowing Rate)",
+    """If your expenses completely drain all of your liquid assets, brokerage accounts, and retirement accounts, the app enters **"Liquidity Crisis"** mode. It tracks the missing money as "Unfunded Debt." Because you still need to pay your bills, the engine assumes you must borrow this money via personal loans or credit cards. The Unfunded Debt will compound aggressively year over year based on the **Shortfall Borrowing Rate** you set.""")
+
+    show_faq("What are 'RMDs' and why do they matter so much?",
+    """RMD stands for Required Minimum Distribution. The IRS has a simple rule: you cannot keep money in a Traditional 401(k) or IRA forever. Starting at age 73 (or 75 if you were born in 1960 or later), you must withdraw a minimum amount every single year, whether you need the money or not. 
+    
+    Why do they matter? Because every dollar you're forced to withdraw is added to your taxable income that year — which can push you into a higher tax bracket, cause more of your Social Security to become taxable, and trigger Medicare surcharges (IRMAA).""")
+
+    if not search_q: st.subheader("🏡 REAL ESTATE & MORTGAGES")
+    
+    show_faq("How does the app handle my mortgage?",
+    """You simply enter three things: your current loan balance, your interest rate, and your monthly payment. The app mathematically pays down your mortgage month by month, exactly as your bank would. 
+    
+    When the balance finally hits zero, the mortgage expense automatically disappears from your cash flow for every future year. **You should NOT separately list your mortgage payment in the budget section**.""")
+
+    show_faq("What's the difference between a 'primary residence' and an 'investment property'?",
+    """* **Your primary residence** is where you live. Its mortgage payment and monthly expenses (property taxes, insurance, HOA) flow out as living costs. 
+    * **An investment property** is treated as a business. The app calculates the net cash flow — rent collected minus mortgage payment minus expenses — and only the net profit or loss affects your overall cash flow.""")
+
+    if not search_q: st.subheader("💸 BUDGETS & EXPENSES")
+    
+    show_faq("The expense table has 'Start Phase' and 'End Phase' — what do these mean?",
+    """These control exactly when each expense is active in your lifetime simulation:
+
+    * **"Now"** means the expense starts today.
+    * **"At Retirement"** means the expense either starts when you retire (like travel) or ends when you retire (like a commute).
+    * **"End of Life"** means the expense continues until the last year of your simulation.
+    * **"Custom Year"** lets you enter a specific year.""")
+
+    show_faq("How does healthcare inflation work, and why is it different from regular inflation?",
+    """Regular consumer inflation (food, clothing) has historically averaged around 2-3% per year. Healthcare costs, however, have consistently risen at 5-7% per year for decades. This means a healthcare expense that costs $500/month today might cost over $1,300/month in 20 years. The app applies a separate, higher inflation rate specifically to anything categorized as "Healthcare" or "Insurance".""")
+
+    if not search_q: st.subheader("🏥 HEALTHCARE & MEDICARE")
+    
+    show_faq("What is the 'Pre-Medicare Gap' and why is it so expensive?",
+    """If you retire before age 65, you face a potentially brutal financial gap. Most working Americans get health insurance through their employer. The moment you retire, that coverage ends. You're now on your own for health insurance until Medicare kicks in at age 65. The app automatically adds a proxy cost to your simulation if you retire early, scaled to your income level.""")
+
+    show_faq("What is 'IRMAA' and why might I have to pay extra for Medicare?",
+    """IRMAA stands for Income-Related Monthly Adjustment Amount. It's essentially a Medicare "high earner surcharge." If your income in retirement exceeds certain thresholds (starting around $103,000/year for singles or $206,000/year for couples), the government charges you extra for your Medicare premiums. The app calculates and applies IRMAA automatically every year.""")
+
+    show_faq("What is 'Long-Term Care' and why is it in the stress tests?",
+    """Long-Term Care (LTC) refers to extended help with daily activities — typically needed in the final years of life. This care is extremely expensive: a private nursing home room in the US costs $90,000-$120,000+ per year, and this is almost entirely NOT covered by regular Medicare. The "LTC Shock" stress test injects a massive medical expense into the final 2-3 years of your simulation.""")
+
+    if not search_q: st.subheader("📊 TAXES & ROTH CONVERSIONS")
+    
+    show_faq("What is a 'progressive' tax system? Why don't I just multiply my income by my tax rate?",
+    """The US uses a system where higher income is taxed at progressively higher rates — but crucially, only the portion of your income that falls within each "bracket" is taxed at that bracket's rate. Think of it like filling buckets. Only income above the highest bracket threshold gets taxed at the top rate.""")
+        
+    show_faq("How do I read the 'Tax Obligations Breakdown' chart?",
+    """Because taxes are often the single largest expense in retirement, the app separates them out so you can see exactly where your money is going:
+    
+    * **Baseline Federal & State Tax:** Your normal income taxes.
+    * **FICA (SS & Medicare):** Payroll taxes. You'll notice these completely disappear the year you retire.
+    * **Roth Conversion Taxes:** The extra income tax you volunteered to pay to move money from a Traditional to a Roth account.
+    * **Cap Gains & Penalties:** Taxes paid when you are forced to sell Brokerage assets, or the 10% IRS early withdrawal penalty.
+    * **Medicare IRMAA Surcharge:** The hidden high-income Medicare penalty.""")
+
+    show_faq("What is a Roth conversion and how does the Optimizer work?",
+    """A Roth conversion is a deliberate decision to move money from your Traditional 401(k) (where you'll owe taxes when you withdraw) into a Roth IRA (where all future growth and withdrawals are tax-free). You pay the income taxes on the converted amount now, in the current year.
+    
+    **How the Optimizer Works:** When enabled, it identifies the years where your taxable income is below your chosen target bracket (e.g., the 24% bracket). It calculates exactly how much money it can convert to fill that bracket up to the brim, checks if you have enough liquid cash to pay the tax bill, and executes the conversion automatically.""")
+
+    if not search_q: st.subheader("📈 AI, SENSITIVITY & MONTE CARLO SIMULATION")
+    
+    show_faq("How do the AI Fiduciary Report and What-If Simulator work?",
+    """Instead of generic financial advice, the AI tab passes your *exact* mathematical timeline, your asset balances, and your specific macroeconomic assumptions to an advanced Large Language Model (Gemini).
+    
+    * **The Comprehensive Report** acts as a fiduciary planner reviewing your baseline file. It will tell you specifically when your highest tax years are, warn you of impending IRMAA cliffs, and lay out an exact blueprint for Roth Conversions.
+    * **The What-If Simulator** allows you to type natural language scenarios ("What if I sold my rental property in 2030?") and the AI calculates how that alters your trajectory.""")
+
+    show_faq("What is the Sensitivity 'Tornado' Chart?",
+    """A Sensitivity Analysis tests how fragile your plan is to a single variable changing. 
+    
+    The Tornado Chart runs 10 alternate dimensions of your life simultaneously—tweaking Inflation by 1%, dropping Market Returns by 1%, retiring 2 years early, etc.—and measures how much each tweak changes your Final Net Worth. It is sorted from the biggest impact at the top to the smallest at the bottom.""")
+        
+    show_faq("What is Sequence of Returns Risk?",
+    """The order in which you experience market returns matters enormously once you're withdrawing from your portfolio. 
+    
+    If the market crashes 40% in your first year of retirement and you're forced to sell investments to cover living expenses, you're locking in permanent losses at the worst possible time. Even if the market recovers beautifully over the next decade, you have fewer shares left to benefit from that recovery. The "-25% Market Crash at Retirement" stress test directly simulates this risk.""")
+
+    show_faq("What is Monte Carlo simulation in plain English?",
+    """Imagine running your retirement plan 200 times in parallel, but each time the stock market behaves differently — sometimes great, sometimes terrible, sometimes mediocre. 
+    
+    Monte Carlo simulation takes your real financial plan and runs it through hundreds of randomly generated market scenarios based on historical volatility. The result is a "probability of success" percentage. An 85% success rate means that in 85 out of 100 randomly generated futures, your money lasted until the end of your life expectancy.""")
+
+    if not search_q: st.subheader("💾 SAVING & SECURITY")
+    
+    show_faq("Is my financial data safe?",
+    """Your data is stored in Google Firebase — one of the most secure cloud storage platforms in the world. Your account is protected by email and password authentication. 
+    
+    That said, no online system is completely immune to risk. This app is a planning tool — **you do not need to enter actual account numbers, social security numbers, or banking credentials anywhere**. Only use estimated balances and income figures.""")
+
+    show_faq("What happens to my data if I use 'Guest Mode'?",
+    """In Guest Mode, everything you enter exists only in your current browser session. The moment you close the browser tab or refresh the page, all of your data is permanently gone. Guest Mode is great for a quick exploration of the app's features, but if you want to save your plan and return to it later, you need to create a free account.""")
 
 
 # --- PAGE ROUTING & EXECUTION ---
@@ -3249,48 +3632,99 @@ with st.sidebar:
     st.markdown("<br>", unsafe_allow_html=True)
 
     status = get_completion_status()
-    nav_options = []
-    for page_name in list(PAGES.keys()):
+    current_page = st.session_state.get('current_page', list(PAGES.keys())[0])
+
+    # --- FIX: Nuclear Wildcard CSS for Left Alignment ---
+    st.markdown("""
+        <style>
+        /* Force the button itself to start from the left */
+        section[data-testid="stSidebar"] button {
+            justify-content: flex-start !important;
+            padding-left: 20px !important; 
+        }
+        
+        /* The Wildcard (*): Forces EVERY hidden Streamlit div, paragraph, and span inside the button to left-align */
+        section[data-testid="stSidebar"] button * {
+            display: flex !important;
+            justify-content: flex-start !important;
+            text-align: left !important;
+            width: 100% !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-bottom: 10px;'></div>", unsafe_allow_html=True)
+
+    # --- FIX: Right-Aligned Checkmarks ---
+    for page_name in PAGES.keys():
+        is_complete = False
+        
+        # Substring mapping to backend keys
         if "Profile" in page_name:
-            nav_options.append(f"{'✅ ' if status['profile'] else ''}{page_name}")
+            is_complete = status.get("profile", False)
         elif "Income" in page_name:
-            nav_options.append(f"{'✅ ' if status['income'] else ''}{page_name}")
+            is_complete = status.get("income", False)
         elif "Assets" in page_name:
-            nav_options.append(f"{'✅ ' if status['assets'] else ''}{page_name}")
-        elif "Cash Flows" in page_name:
-            nav_options.append(f"{'✅ ' if status['expenses'] else ''}{page_name}")
-        else:
-            nav_options.append(page_name)
+            is_complete = status.get("assets", False)
+        elif "Cash" in page_name:
+            is_complete = status.get("expenses", False)
 
-    current_active_idx = 0
-    curr_page = st.session_state.get('current_page', '🏠 Dashboard')
+        # Append the checkmark to the END of the string with an Em Space for breathing room
+        suffix = " ✅" if is_complete else ""
+
+        # Construct the final label: "[Emoji] [Text]    [Checkmark]"
+        label = f"{page_name}{suffix}"
+        
+        btn_type = "primary" if page_name == current_page else "tertiary"
+        
+        if st.button(label, type=btn_type, width='stretch', key=f"nav_{page_name}"):
+            st.session_state['current_page'] = page_name
+            st.rerun()
+
+    # --- Dynamic Color-Changing Progress Bar ---
+    st.markdown("<hr style='margin-top: 15px; margin-bottom: 20px; border-color: rgba(255,255,255,0.1);'>", unsafe_allow_html=True)
     
-    for i, opt in enumerate(nav_options):
-        clean_opt = opt.replace("✅ ", "")
-        if curr_page == clean_opt:
-            current_active_idx = i
-            break
-
-    selected_nav_item = st.radio("Navigation", nav_options, index=current_active_idx, label_visibility="collapsed")
-    clean_page_name = selected_nav_item.replace("✅ ", "")
+    score = status.get('score', 0)
     
-    # --- FIX: Only update state and force a rerun if the USER clicked the radio button ---
-    # This prevents the radio widget's old internal state from overriding dashboard button clicks!
-    if clean_page_name != curr_page:
-        st.session_state['current_page'] = clean_page_name
-        st.rerun()
+    if score == 100:
+        bar_color = "#10b981" # Green
+        text_color = "#10b981"
+    elif score >= 75:
+        bar_color = "#eab308" # Yellow
+        text_color = "#64748b"
+    elif score >= 50:
+        bar_color = "#f97316" # Orange
+        text_color = "#64748b"
+    else:
+        bar_color = "#ef4444" # Red
+        text_color = "#64748b"
 
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size: 0.85rem; color: {text_color}; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px;'>Blueprint Completion: {score}%</div>", unsafe_allow_html=True)
+    
+    st.markdown(f"""
+        <div style="width: 100%; background-color: rgba(255,255,255,0.1); border-radius: 4px; margin-bottom: 24px; height: 8px;">
+            <div style="width: {score}%; height: 100%; background-color: {bar_color}; border-radius: 4px; transition: width 0.4s ease, background-color 0.4s ease;"></div>
+        </div>
+    """, unsafe_allow_html=True)
+    # ------------------------------------------------
 
-    save_btn_label = "⚠️ Save Changes" if st.session_state.get('dirty', False) else "🚀 Save Profile"
-    if st.button(save_btn_label, type="primary", use_container_width=True):
-        save_profile()
+    # --- FIX: Guest Mode UX - Replace Save Button with Account Creation CTA ---
+    if st.session_state.get('user_email') == "guest_demo":
+        if st.button("🔐 Create Account to Save", type="primary", width='stretch', help="Guest profiles cannot be saved. Create a free account to persist your data."):
+            st.session_state.clear()
+            st.rerun()
+    else:
+        save_btn_label = "⚠️ Save Changes" if st.session_state.get('dirty', False) else "🚀 Save Profile"
+        if st.button(save_btn_label, type="primary", width='stretch'):
+            save_profile()
 
-    if st.button("Logout", type="secondary", use_container_width=True):
-        if cookie_manager.get("user_email"): 
+    if st.button("Logout", type="secondary", width='stretch'):
+        # --- FIX: Delete the secure UID cookie ---
+        if cookie_manager.get("user_uid"): 
+            cookie_manager.delete("user_uid")
+        if cookie_manager.get("user_email"): # Clean up legacy cookies from previous versions
             cookie_manager.delete("user_email")
             
-        # --- FIX: Preserve app-level state, safely nuke user data & triggers ---
         system_keys = {'firebase_enabled', 'logged_out_flag'}
         for key in list(st.session_state.keys()):
             # Preserve system flags and the invisible cookie manager component state
@@ -3301,5 +3735,36 @@ with st.sidebar:
         time.sleep(0.5)
         st.rerun()
 
-if st.session_state.get('current_page') in PAGES:
+# =====================================================================
+# --- FINAL PAGE ROUTING & ISOLATED BANNERS ---
+# =====================================================================
+
+# 1. Reserve an empty, isolated container at the top of the screen.
+# This prevents the warning banner from shifting the DOM and resetting your tabs!
+banner_placeholder = st.empty()
+
+# 2. Render the Active Page safely below the placeholder
+if 'current_page' not in st.session_state:
+    st.session_state['current_page'] = "🏠 Dashboard"
+
+if st.session_state['current_page'] in PAGES:
     PAGES[st.session_state['current_page']]()
+
+# 3. Inject the Global Contextual Banners INTO the reserved placeholder
+with banner_placeholder.container():
+    user_uid = st.session_state.get('user_uid') 
+
+    if user_uid == "guest_demo":
+        guest_col1, guest_col2 = st.columns([4, 1])
+        guest_col1.info("🏃 **Guest Mode:** Your data is only stored in this browser tab. To save your progress and access it from any device, create a free account.")
+        if guest_col2.button("💾 Create Account", type="primary", key="btn_guest_signup", width='stretch'):
+            st.session_state.clear()
+            st.rerun()
+        st.markdown("<div style='margin-bottom: 10px;'></div>", unsafe_allow_html=True)
+
+    elif st.session_state.get('dirty', False):
+        warn_col1, warn_col2 = st.columns([5, 1])
+        warn_col1.warning("⚠️ **Unsaved Changes Detected:** You have modified your financial blueprint. Don't forget to save your profile to the cloud before closing the app!")
+        if warn_col2.button("💾 Save Now", type="primary", key="btn_global_save", width='stretch'):
+            save_profile()
+        st.markdown("<div style='margin-bottom: 10px;'></div>", unsafe_allow_html=True)
